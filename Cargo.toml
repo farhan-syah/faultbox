@@ -19,9 +19,22 @@ all-features = true
 
 [lib]
 
+[features]
+# Out-of-process native-crash (SIGSEGV/abort/stack-overflow) capture as a
+# minidump. Pulls in the Embark crash toolchain and requires the host to call
+# `blackbox::run_crash_monitor_if_env()` at the very top of `main`. Off by
+# default so the base recorder (panics, corruption, invariants) stays lean.
+native-crash = ["dep:crash-handler", "dep:minidumper"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Native-crash capture (optional; enabled by the `native-crash` feature).
+# minidumper drives an out-of-process monitor that writes the minidump of the
+# crashed process; crash-handler installs the async-signal-safe crash hooks.
+crash-handler = { version = "0.8", optional = true }
+minidumper = { version = "0.11", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

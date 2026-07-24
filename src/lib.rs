@@ -29,6 +29,8 @@
 pub mod breadcrumbs;
 pub mod build_id;
 pub mod context;
+#[cfg(feature = "native-crash")]
+pub mod native;
 pub mod panic;
 pub mod report;
 pub mod writer;
@@ -64,6 +66,11 @@ pub struct Config {
     pub redactor: Box<dyn Redactor>,
     /// Whether [`init`] installs the panic hook.
     pub install_panic_hook: bool,
+    /// Whether [`init`] installs the out-of-process native-crash handler
+    /// (`native-crash` feature only). Requires the host to call
+    /// [`run_crash_monitor_if_env`] at the top of `main`. Defaults to `true`
+    /// when the feature is compiled in.
+    pub install_native_crash_handler: bool,
 }
 
 impl Config {
@@ -83,6 +90,7 @@ impl Config {
             breadcrumb_capacity: 128,
             redactor: Box::new(NoopRedactor),
             install_panic_hook: true,
+            install_native_crash_handler: cfg!(feature = "native-crash"),
         }
     }
 
@@ -109,6 +117,12 @@ impl Config {
         self.install_panic_hook = yes;
         self
     }
+
+    #[must_use]
+    pub fn install_native_crash_handler(mut self, yes: bool) -> Self {
+        self.install_native_crash_handler = yes;
+        self
+    }
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -127,7 +141,33 @@ pub fn init(config: Config) -> bool {
     if install_hook {
         panic::install_hook();
     }
+    #[cfg(feature = "native-crash")]
+    {
+        let cfg = CONFIG.get().expect("config was just set");
+        if cfg.install_native_crash_handler {
+            native::install(cfg);
+        }
+    }
     true
+}
+
+/// Divert to the native-crash monitor loop when this process was spawned as one
+/// (the `native-crash` feature's monitor). Call at the very top of `main`,
+/// before any argument parsing. Returns `false` in a normal process; in the
+/// monitor it runs to completion and exits without returning.
+///
+/// A no-op returning `false` when the `native-crash` feature is disabled, so the
+/// call site stays identical regardless of feature selection.
+#[must_use]
+pub fn run_crash_monitor_if_env() -> bool {
+    #[cfg(feature = "native-crash")]
+    {
+        native::run_crash_monitor_if_env()
+    }
+    #[cfg(not(feature = "native-crash"))]
+    {
+        false
+    }
 }
 
 /// The active config, if [`init`] has run.
