@@ -125,7 +125,7 @@ macro_rules! breadcrumb {
             $crate::breadcrumbs::Level::$level,
             $category,
             $message,
-            ::serde_json::json!($fields),
+            $crate::serde_json::json!($fields),
         )
     };
     ($level:ident, $category:expr, $message:expr) => {
@@ -133,7 +133,7 @@ macro_rules! breadcrumb {
             $crate::breadcrumbs::Level::$level,
             $category,
             $message,
-            ::serde_json::Value::Null,
+            $crate::serde_json::Value::Null,
         )
     };
 }

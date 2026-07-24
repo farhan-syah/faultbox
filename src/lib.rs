@@ -40,6 +40,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub use context::{Adhoc, DomainContext, NoopRedactor, Redactor};
 pub use report::{Artifact, Env, EventKind, Frame, Meta, Report, SCHEMA_VERSION};
 
+/// Re-exported so adopters can build [`DomainContext::to_json`] payloads
+/// (`blackbox::serde_json::json!{…}`) without taking their own dependency.
+pub use serde_json;
+
 /// Process-wide configuration, set once via [`init`].
 pub struct Config {
     /// Adopting project name, e.g. `"pagedb"`.
