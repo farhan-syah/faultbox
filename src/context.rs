@@ -20,8 +20,8 @@ use serde::Serialize;
 /// the configured [`Redactor`] to the serialized value as defence in depth.
 pub trait DomainContext {
     /// Short domain tag, e.g. `"pagedb.dangling_child"`. Becomes part of the
-    /// fingerprint and groups reports by failure site.
-    fn domain_kind(&self) -> &str;
+    /// fingerprint and groups reports by failure site. A compile-time constant.
+    fn domain_kind(&self) -> &'static str;
 
     /// A stable identifier for *this class* of failure — NOT this instance.
     /// e.g. `"kind=0x09"` for "internal child recycled as overflow root",
@@ -42,7 +42,7 @@ pub struct Adhoc<T: Serialize> {
 }
 
 impl<T: Serialize> DomainContext for Adhoc<T> {
-    fn domain_kind(&self) -> &str {
+    fn domain_kind(&self) -> &'static str {
         self.kind
     }
     fn grouping_key(&self) -> String {

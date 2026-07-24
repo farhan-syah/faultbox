@@ -16,7 +16,7 @@ struct DanglingChild {
 }
 
 impl DomainContext for DanglingChild {
-    fn domain_kind(&self) -> &str {
+    fn domain_kind(&self) -> &'static str {
         "pagedb.dangling_child"
     }
     fn grouping_key(&self) -> String {
