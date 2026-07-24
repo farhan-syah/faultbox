@@ -119,6 +119,41 @@ pub fn preserve_artifact(report_dir: &Path, src: &Path, name: &str) -> io::Resul
     Ok(name.to_owned())
 }
 
+/// Find an already-preserved copy of artifact `name` in a *sibling* report
+/// directory that shares this `fingerprint`, so a crash-loop re-detecting the
+/// same failure doesn't re-copy the same multi-megabyte snapshot into every
+/// report. Report dirs are named `<ts>-<fp8>`, so siblings of one bug share the
+/// `-<fp8>` suffix; `exclude` (the current report's own dir) is skipped.
+///
+/// Returns the sibling copy's path *relative to `exclude`* (`../<sib>/<name>`),
+/// suitable as an [`Artifact::rel_path`] that still resolves from the report
+/// dir — the dedup is transparent to any tool that opens the report.
+///
+/// [`Artifact::rel_path`]: crate::report::Artifact::rel_path
+#[must_use]
+pub fn find_preserved_sibling(
+    reports_dir: &Path,
+    fingerprint: &str,
+    name: &str,
+    exclude: &Path,
+) -> Option<PathBuf> {
+    let fp8: String = fingerprint.chars().take(8).collect();
+    let suffix = format!("-{fp8}");
+    for entry in std::fs::read_dir(reports_dir).ok()?.flatten() {
+        let dir = entry.path();
+        if dir == exclude || !dir.is_dir() {
+            continue;
+        }
+        if !entry.file_name().to_string_lossy().ends_with(&suffix) {
+            continue;
+        }
+        if dir.join(name).exists() {
+            return Some(PathBuf::from("..").join(entry.file_name()).join(name));
+        }
+    }
+    None
+}
+
 /// Write `bytes` to `path` atomically: to a temp sibling then rename.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("json.tmp");
@@ -214,6 +249,32 @@ mod tests {
         assert_eq!(rel, "store.corrupt");
         assert!(report_dir.join("store.corrupt/main.db").is_file());
         assert!(report_dir.join("store.corrupt/seg/s0").is_file());
+    }
+
+    #[test]
+    fn find_preserved_sibling_locates_prior_copy_and_skips_self() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path();
+        // An earlier report of fingerprint `abcdef01…` that already preserved
+        // `store.corrupt`.
+        let prior = reports.join("100-abcdef01");
+        std::fs::create_dir_all(prior.join("store.corrupt")).unwrap();
+        std::fs::write(prior.join("store.corrupt/main.db"), b"pages").unwrap();
+        // The current report dir (empty) — same fingerprint, later timestamp.
+        let current = reports.join("200-abcdef01");
+        std::fs::create_dir_all(&current).unwrap();
+
+        let rel = find_preserved_sibling(reports, "abcdef0123456789", "store.corrupt", &current)
+            .expect("prior sibling copy should be found");
+        assert_eq!(rel, PathBuf::from("../100-abcdef01/store.corrupt"));
+        // Resolves back to the real file from the current report dir.
+        assert!(current.join(&rel).join("main.db").is_file());
+
+        // A different fingerprint has no sibling to dedup against.
+        assert!(
+            find_preserved_sibling(reports, "ffffffffffffffff", "store.corrupt", &current)
+                .is_none()
+        );
     }
 
     fn sample_report() -> Report {

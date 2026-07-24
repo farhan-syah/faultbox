@@ -328,6 +328,26 @@ impl Capture {
 
         let dir = writer::report_dir_for(&cfg.reports_dir, &report).ok()?;
         for pending in &self.artifacts {
+            // Cross-process dedup: if an earlier report of this same fingerprint
+            // already preserved an identical snapshot, reference it instead of
+            // re-copying. Without this, a corrupt-store crash-loop balloons the
+            // reports directory with duplicate multi-MB copies.
+            if let Some(rel) = writer::find_preserved_sibling(
+                &cfg.reports_dir,
+                &report.fingerprint,
+                &pending.name,
+                &dir,
+            ) {
+                report.artifacts.push(Artifact {
+                    kind: pending.kind.clone(),
+                    rel_path: rel.to_string_lossy().into_owned(),
+                    note: Some(match &pending.note {
+                        Some(n) => format!("{n} (deduplicated: shared with an earlier report)"),
+                        None => "deduplicated: shared with an earlier report".to_owned(),
+                    }),
+                });
+                continue;
+            }
             match writer::preserve_artifact(&dir, &pending.src, &pending.name) {
                 Ok(rel) => report.artifacts.push(Artifact {
                     kind: pending.kind.clone(),
