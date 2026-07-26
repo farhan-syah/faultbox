@@ -189,46 +189,42 @@ fn mask_secret_assignments(input: &str) -> String {
     while i < bytes.len() {
         // Does a secret key name end at this separator?
         let sep = bytes[i];
-        if sep == b'=' || sep == b':' {
-            if let Some(key_start) = SECRET_KEYS
-                .iter()
-                .filter_map(|k| {
-                    let end = i;
-                    let start = end.checked_sub(k.len())?;
-                    (lower.get(start..end)? == *k
-                        && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric()))
-                    .then_some(start)
+        if (sep == b'=' || sep == b':')
+            && SECRET_KEYS.iter().any(|k| {
+                // Does this key name end exactly at the separator, on a word
+                // boundary? The boundary check keeps `broken_tokens=4` from
+                // matching `token`.
+                i.checked_sub(k.len()).is_some_and(|start| {
+                    lower.get(start..i) == Some(*k)
+                        && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
                 })
-                .max()
-            {
-                // Emit up to and including the separator (already in `out`
-                // except for the separator itself).
-                let _ = key_start;
-                out.push(sep as char);
+            })
+        {
+            // Emit the separator (everything before it is already in `out`).
+            out.push(sep as char);
+            i += 1;
+            // Skip whitespace and an opening quote.
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'"') {
+                out.push(bytes[i] as char);
                 i += 1;
-                // Skip whitespace and an opening quote.
-                while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'"') {
-                    out.push(bytes[i] as char);
-                    i += 1;
-                }
-                // Already redacted (this string is being redacted twice, e.g. a
-                // message that passed through a caller's own redactor first).
-                // Copy the marker through rather than treating `[redacted]` as
-                // a fresh value and emitting `[redacted]]`.
-                if input[i..].starts_with(REDACTED) {
-                    out.push_str(REDACTED);
-                    i += REDACTED.len();
-                    continue;
-                }
-                let value_start = i;
-                while i < bytes.len() && !is_value_terminator(bytes[i]) {
-                    i += 1;
-                }
-                if i > value_start {
-                    out.push_str(REDACTED);
-                }
+            }
+            // Already redacted (this string is being redacted twice, e.g. a
+            // message that passed through a caller's own redactor first).
+            // Copy the marker through rather than treating `[redacted]` as
+            // a fresh value and emitting `[redacted]]`.
+            if input[i..].starts_with(REDACTED) {
+                out.push_str(REDACTED);
+                i += REDACTED.len();
                 continue;
             }
+            let value_start = i;
+            while i < bytes.len() && !is_value_terminator(bytes[i]) {
+                i += 1;
+            }
+            if i > value_start {
+                out.push_str(REDACTED);
+            }
+            continue;
         }
         // Copy the whole UTF-8 character through.
         let start = i;
