@@ -1,0 +1,100 @@
+# Tag gate for a releasable build. Pushing a v* tag validates the tag, runs the
+# full test suite, and packages the crate once. Nothing is published and nothing
+# leaves the repo.
+#
+# The manual `Release` workflow then consumes THIS run's `.crate` artifact by
+# run ID, so a failure in any distribution stage can be fixed and retried
+# without repeating the tests or the packaging.
+#
+# Artifacts are retained 14 days: that is the window in which a `Release` run
+# can still resume from this prepare run.
+
+name: Release Prepare
+run-name: Release Prepare ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-prepare-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-version:
+    uses: ./.github/workflows/release-validate.yml
+    with:
+      ref: ${{ github.ref_name }}
+
+  # Full lint + audit + the suite on all three platforms. Calls test.yml
+  # directly rather than ci.yml, whose pull_request trigger cannot fire here.
+  ci:
+    name: CI Gate
+    needs: validate-version
+    uses: ./.github/workflows/test.yml
+
+  package:
+    name: Package crate
+    needs: [validate-version, ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-package
+
+      # `--all-features` so the packaged manifest is verified against the full
+      # dependency tree, which is what docs.rs will build.
+      - name: Package
+        run: cargo package --all-features
+
+      - name: Show contents
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          ls -lh "target/package/faultbox-${VERSION}.crate"
+          tar tzf "target/package/faultbox-${VERSION}.crate"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: crate
+          path: target/package/faultbox-*.crate
+          retention-days: 14
+
+  summary:
+    name: Release instructions
+    needs: [validate-version, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          {
+            echo "## Prepared v${VERSION}"
+            echo
+            echo "Tests passed and the crate is packaged. Publish with:"
+            echo
+            echo '```sh'
+            echo "gh workflow run release.yml -R ${REPO} \\"
+            echo "  -f tag=v${VERSION} \\"
+            echo "  -f prepare_run_id=${RUN_ID}"
+            echo '```'
+            echo
+            echo "If one stage fails, re-run the same command with only the"
+            echo "remaining stages enabled (\`-f publish_crate=false\`, etc.)."
+            echo "Nothing is recompiled."
+          } >> "$GITHUB_STEP_SUMMARY"

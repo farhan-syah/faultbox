@@ -1,0 +1,131 @@
+# Manual distribution workflow. Push a v* tag first; `Release Prepare` runs the
+# test suite and packages the crate. Then run this workflow with that tag and
+# the successful prepare run ID.
+#
+# NOTHING HERE COMPILES the test suite again. Every stage consumes the prepare
+# run's artifact, so a failure in one stage is retried by re-dispatching with
+# only that stage enabled — the tests are never re-run to fix a crates.io
+# timeout or a bad release body.
+#
+# Stages, in dependency order:
+#   publish_crate   -> crates.io
+#   github_release  -> GitHub Release carrying the .crate file
+#
+# Each stage is idempotent: an already-published version is skipped, and the
+# release is overwritten in place. Re-running everything is safe; the toggles
+# exist to save time, not to protect against double-publishing.
+#
+# Required secrets: CARGO_REGISTRY_TOKEN.
+
+name: Release
+run-name: Release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v0.1.0"
+        required: true
+        type: string
+      prepare_run_id:
+        description: "Successful Release Prepare run ID holding the .crate"
+        required: true
+        type: string
+      publish_crate:
+        description: "Publish to crates.io"
+        type: boolean
+        default: true
+      github_release:
+        description: "Create the GitHub Release"
+        type: boolean
+        default: true
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Always runs. Cheap, and it guarantees the dispatched tag still means what
+  # the prepare run assumed it meant.
+  validate-version:
+    uses: ./.github/workflows/release-validate.yml
+    with:
+      ref: ${{ inputs.tag }}
+
+  # ── crates.io ──────────────────────────────────────────────────────────────
+  publish-crate:
+    name: Publish to crates.io
+    needs: validate-version
+    if: inputs.publish_crate
+    runs-on: ubuntu-latest
+    environment: crates.io
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Skip if this exact version is already indexed, so a re-dispatch
+          # after a partial failure is a no-op rather than an error.
+          if curl -sf \
+            -H "User-Agent: faultbox-ci (github.com/${{ github.repository }})" \
+            "https://crates.io/api/v1/crates/faultbox/${VERSION}" > /dev/null 2>&1
+          then
+            echo "faultbox@${VERSION} already published — skipping"
+            exit 0
+          fi
+
+          # Verified here rather than trusting the prepare run's artifact: the
+          # registry is what consumers get, and this is the last gate before it.
+          cargo publish --all-features
+
+  # ── GitHub Release ─────────────────────────────────────────────────────────
+  # Deliberately independent of publish-crate: a crates.io outage must not block
+  # cutting the release, and re-running this stage alone is the fix for a bad
+  # release body.
+  github-release:
+    name: Create GitHub Release
+    needs: validate-version
+    if: inputs.github_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Download crate artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: crate
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ github.token }}
+          path: ./artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: faultbox ${{ needs.validate-version.outputs.version }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ needs.validate-version.outputs.is_full_release != 'true' }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
