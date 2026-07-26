@@ -42,6 +42,8 @@ pub mod writer;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
+// Unused on `wasm32-unknown-unknown`, which has no clock — see `now_ms`.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use context::{Adhoc, BasicRedactor, DomainContext, NoopRedactor, Redactor};
@@ -278,14 +280,35 @@ pub fn config() -> Option<&'static Config> {
     CONFIG.get()
 }
 
-/// Unix-epoch milliseconds now. Falls back to `0` if the clock is before the
-/// epoch (never in practice) so callers stay infallible.
+/// Unix-epoch milliseconds now. Infallible: falls back to `0` if the clock is
+/// before the epoch (never in practice).
+///
+/// On `wasm32-unknown-unknown` there is no clock at all — `SystemTime::now()`
+/// *panics* there with "time not implemented on this platform", and it panics
+/// inside the call, so no error handling around it helps. Because a breadcrumb
+/// is recorded on ordinary success paths, that would make merely linking this
+/// crate into a wasm build fatal the first time any library records a crumb.
+/// A monotonic counter is substituted: the values are not wall-clock times, but
+/// they order breadcrumbs correctly, which is all a trail needs. Reports cannot
+/// be written on that target anyway — there is no filesystem — so nothing else
+/// observes them.
+///
+/// `wasm32-wasip1`/`wasip2` have a real clock and take the normal path.
 #[must_use]
 pub fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TICK: AtomicU64 = AtomicU64::new(0);
+        u128::from(TICK.fetch_add(1, Ordering::Relaxed))
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
 }
 
 /// A pending artifact to copy into the report directory on [`Capture::emit`].
