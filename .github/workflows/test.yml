@@ -99,18 +99,11 @@ jobs:
         with:
           tool: nextest
 
-      # `--profile ci` adds JUnit output and scoped retries for the
-      # process-spawning tests; see .config/nextest.toml.
+      # No retries by design — these tests assert counts, so a retry would hide
+      # a concurrency bug rather than absorb a slow runner. See
+      # .config/nextest.toml.
       - name: Run tests
-        run: cargo nextest run --all-features --profile ci --no-fail-fast
-
-      - name: Upload JUnit report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: junit-${{ matrix.os }}
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
+        run: cargo nextest run --all-features --no-fail-fast
 
   # ─────────────────────────────────────────────────────────────────────────
   # `wasm32-unknown-unknown` has no clock: `SystemTime::now()` panics there

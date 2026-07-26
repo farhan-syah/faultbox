@@ -542,7 +542,22 @@ pub struct DirLock {
 impl DirLock {
     fn acquire(dir: &Path) -> io::Result<DirLock> {
         let path = dir.join(".lock");
-        for _ in 0..100 {
+        // Wait for the holder, however long it takes. The ONLY reason to take
+        // the lock away is staleness, which means the holder died.
+        //
+        // An earlier version gave up after a fixed number of retries and stole
+        // the lock anyway, reasoning that a corrupt counter beat a lost report.
+        // That was wrong twice over: it is not a fallback but a race, and a
+        // contended Windows runner hit it routinely — six processes updating
+        // one group lost two of a hundred and fifty occurrences, silently.
+        //
+        // The wait cannot deadlock, because a lock older than `LOCK_STALE_MS`
+        // is always stolen: whoever holds it is either finished (releasing it)
+        // or dead (letting it go stale), so this loop always makes progress.
+        // The critical section is a small read-modify-write of two JSON files —
+        // bulk artifact copying happens outside it — so a live holder is never
+        // close to the staleness window.
+        loop {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -562,10 +577,6 @@ impl DirLock {
                 Err(e) => return Err(e),
             }
         }
-        // Waited out the retries: steal rather than fail. Losing the mutual
-        // exclusion is a corrupt counter; failing here is a lost report.
-        let _ = std::fs::remove_file(&path);
-        Ok(DirLock { path })
     }
 }
 

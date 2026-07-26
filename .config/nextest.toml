@@ -33,18 +33,17 @@ threads-required = 'num-test-threads'
 [test-groups]
 multiprocess = { max-threads = 1 }
 
-[profile.ci]
-# CI inherits the default profile (the multiprocess group, the timeout) and
-# adds JUnit output plus scoped retries.
+# There is deliberately no separate CI profile.
 #
-# Retries are deliberately limited to the multi-process tests. The rest of the
-# suite is deterministic and a retry there would only mask a real bug. These
-# depend on process spawning and a unix-socket handshake with a monitor — the
-# one genuinely environment-sensitive thing in the suite, and the failure mode
-# on a loaded runner is a slow spawn rather than a wrong answer.
-[[profile.ci.overrides]]
-filter = 'binary(multiprocess)'
-retries = { backoff = "fixed", count = 2, delay = "3s" }
-
-[profile.ci.junit]
-path = "junit.xml"
+# Retries were tried and removed. The multi-process tests look like the kind of
+# thing worth retrying — they spawn processes and shake hands over a socket —
+# but what they actually assert is arithmetic: 150 occurrences must be counted
+# as 150. When a contended Windows runner produced 148, that was a real lost
+# update caused by a lock that could be stolen from a live holder. A retry there
+# does not paper over a slow spawn, it hides a concurrency bug. Timeouts, not
+# retries, are the right tool for slowness, and `slow-timeout` above covers it.
+#
+# JUnit output was also removed: nothing consumes it. With `--no-fail-fast` the
+# console log already lists every failure, so the XML was an artifact uploaded
+# on every run and read by no one. Add it back alongside a reporter that
+# actually renders it, not before.
