@@ -1,0 +1,51 @@
+# cargo-deny configuration.
+#
+# Enforces three things at CI time:
+#   1. No security advisories (`cargo deny check advisories`)
+#   2. Only permissive OSS licenses in the dependency tree
+#      (`cargo deny check licenses`)
+#   3. Only crates.io as a source (`cargo deny check sources`)
+#
+# Run locally: `cargo deny check`
+
+[graph]
+all-features = true
+# Exclude dev-dependencies from the crate graph (the `check` CLI flag
+# `--exclude-dev` was removed in cargo-deny 0.20; it is config-only now).
+exclude-dev = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    # This crate's own license.
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    # Permissive licenses used across the Rust ecosystem.
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+    "MIT-0",
+    "BSL-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

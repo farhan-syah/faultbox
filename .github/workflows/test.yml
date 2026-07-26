@@ -1,27 +1,18 @@
-# Reusable test workflow.
+# Reusable test workflow: fmt, clippy, docs, audit, and the full test suite.
 #
 # Called by:
-#   - ci.yml (PR checks + manual)
+#   - ci.yml              (PR checks)
+#   - release-prepare.yml (tag gate)
 #
-# Not triggered directly — `workflow_call` only.
+# Cache strategy: the Linux jobs share one `target/` cache via
+# `shared-key: workspace`. The `lint` job seeds it on a cold run; the Linux
+# `test`, `features`, and `msrv` jobs then start warm. macOS and Windows keep
+# their own caches — a different target triple cannot reuse those artifacts.
 #
-# Jobs:
-#   lint        — rustfmt + clippy + doc + doctests
-#   test        — `cargo nextest run` on Linux / macOS / Windows. Includes the
-#                 multi-process suite, which spawns the `crash_helper` binary to
-#                 exercise the crash monitor, the cross-process group lock, and
-#                 the shared ring; none of that is reachable in-process.
-#   wasm        — `cargo check` for wasm32-unknown-unknown and wasm32-wasip1.
-#                 The former has no clock, and `SystemTime::now` panics there,
-#                 so this guards the fallback in `now_ms`.
-#   features    — every feature flag is off by default and each pulls its own
-#                 dependencies, so each combination is checked separately to
-#                 catch a `cfg`-gated import that only breaks when a feature is
-#                 absent.
-#   msrv        — the declared `rust-version` must actually build.
-#   package     — `cargo package`, which catches manifest problems that only
-#                 surface at publish time (a missing README, an excluded file
-#                 something still references).
+# Every feature is off by default and each pulls in its own dependency tree, so
+# the feature matrix exists to catch the combination that only breaks when a
+# feature is *absent* — a `cfg`-gated import, or a struct field that only some
+# builds have.
 
 name: Test
 
@@ -38,8 +29,11 @@ env:
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
   lint:
-    name: Lint, Format & Docs
-    runs-on: ubuntu-latest
+    name: Lint, Docs & Audit
+    # Free ARM64 runner for public repos: faster per-core than ubuntu-latest at
+    # the same (zero) cost. Safe here because this job only compiles — the
+    # crash/minidump tests that are most architecture-sensitive run in `test`.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
 
@@ -50,12 +44,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: lint
+          shared-key: workspace
 
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: cargo fmt --all -- --check
 
-      - name: Clippy (all targets, all features)
+      - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build docs
@@ -68,7 +62,21 @@ jobs:
       - name: Run doctests
         run: cargo test --doc --all-features
 
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Dependency audit
+        run: cargo deny check
+
   # ─────────────────────────────────────────────────────────────────────────
+  # The suite spawns real child processes: a crash monitor that re-execs the
+  # helper binary, several processes contending for a file lock, and several
+  # writing one mmap'd ring. Those behave differently per OS, so all three run
+  # the full suite rather than compile-checking the non-Linux ones.
+  #
+  # `--no-fail-fast` so one regression surfaces every failure in a single run.
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -84,20 +92,34 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: test-${{ matrix.os }}
+          shared-key: test-${{ matrix.os }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
+      # `--profile ci` adds JUnit output and scoped retries for the
+      # process-spawning tests; see .config/nextest.toml.
       - name: Run tests
-        run: cargo nextest run --all-features --no-fail-fast
+        run: cargo nextest run --all-features --profile ci --no-fail-fast
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
 
   # ─────────────────────────────────────────────────────────────────────────
+  # `wasm32-unknown-unknown` has no clock: `SystemTime::now()` panics there
+  # rather than returning an error. Since a breadcrumb is recorded on ordinary
+  # success paths, a regression in that fallback would make merely linking this
+  # crate into a wasm build fatal — hence a standing check.
   wasm:
     name: WASM / WASI check (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
@@ -112,7 +134,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: wasm-${{ matrix.target }}
+          shared-key: wasm-${{ matrix.target }}
 
       # Default features only: `native-crash` and `shared-ring` are host-only.
       - name: cargo check --lib
@@ -120,13 +142,13 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────────
   features:
-    name: Feature matrix (${{ matrix.flags }})
-    runs-on: ubuntu-latest
+    name: Feature matrix (${{ matrix.flags || 'default' }})
+    runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
         flags:
-          - "" # default features
+          - ""
           - "--features tracing"
           - "--features shared-ring"
           - "--features native-crash"
@@ -139,33 +161,36 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: features
+          shared-key: workspace
 
       - name: cargo check
         run: cargo check --lib --bins --tests ${{ matrix.flags }}
 
   # ─────────────────────────────────────────────────────────────────────────
+  # The declared `rust-version` must actually build. 1.88 is required by this
+  # crate's own let-chains as well as by the native-crash dependency tree.
   msrv:
     name: MSRV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
 
-      # Must match `rust-version` in Cargo.toml.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.88.0
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: msrv
+          shared-key: msrv
 
       - name: cargo check
         run: cargo check --all-features --all-targets
 
   # ─────────────────────────────────────────────────────────────────────────
+  # Catches manifest problems that only surface at publish time: a missing
+  # README, or an `exclude`d file that something still references.
   package:
     name: Package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
 
@@ -174,7 +199,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: package
+          shared-key: workspace
 
       - name: cargo package
         run: cargo package --all-features

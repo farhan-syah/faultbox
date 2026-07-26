@@ -1,0 +1,50 @@
+# nextest configuration. Run with: cargo nextest run --all-features
+#
+# Why nextest over `cargo test`:
+#   - Each test runs in its own process, so the process-wide state this crate
+#     owns (the `OnceLock` config, the panic hook, the breadcrumb ring) cannot
+#     leak between tests. Several tests call `init`, which is once-per-process
+#     by design — under `cargo test` they would fight over it.
+#   - Per-test timeouts turn a hang into a failure. The multi-process tests
+#     wait on a spawned monitor; without a timeout a broken handshake would
+#     stall CI instead of failing it.
+#   - JUnit XML for CI.
+
+[profile.default]
+# Hard ceiling per test. The slowest test in the suite takes ~0.3s (a real
+# SIGSEGV, out-of-process minidump, and the poll for the report), so anything
+# near this is a hang, not a slow test.
+slow-timeout = { period = "30s", terminate-after = 4 }
+test-threads = "num-cpus"
+
+# The multi-process suite spawns real child processes — up to six at once for
+# the lock-contention test, plus a crash monitor that is itself a re-exec of the
+# helper binary. Running several of those concurrently on a 2-core CI runner
+# oversubscribes it badly enough to look like a timing flake.
+#
+# `threads-required = "num-test-threads"` makes each one claim every slot, so
+# they run strictly alone; the rest of the suite keeps full parallelism the
+# moment they finish.
+[[profile.default.overrides]]
+filter = 'binary(multiprocess)'
+test-group = 'multiprocess'
+threads-required = 'num-test-threads'
+
+[test-groups]
+multiprocess = { max-threads = 1 }
+
+[profile.ci]
+# CI inherits the default profile (the multiprocess group, the timeout) and
+# adds JUnit output plus scoped retries.
+#
+# Retries are deliberately limited to the multi-process tests. The rest of the
+# suite is deterministic and a retry there would only mask a real bug. These
+# depend on process spawning and a unix-socket handshake with a monitor — the
+# one genuinely environment-sensitive thing in the suite, and the failure mode
+# on a loaded runner is a slow spawn rather than a wrong answer.
+[[profile.ci.overrides]]
+filter = 'binary(multiprocess)'
+retries = { backoff = "fixed", count = 2, delay = "3s" }
+
+[profile.ci.junit]
+path = "junit.xml"
