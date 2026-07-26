@@ -1,0 +1,180 @@
+# Reusable test workflow.
+#
+# Called by:
+#   - ci.yml (PR checks + manual)
+#
+# Not triggered directly — `workflow_call` only.
+#
+# Jobs:
+#   lint        — rustfmt + clippy + doc + doctests
+#   test        — `cargo nextest run` on Linux / macOS / Windows. Includes the
+#                 multi-process suite, which spawns the `crash_helper` binary to
+#                 exercise the crash monitor, the cross-process group lock, and
+#                 the shared ring; none of that is reachable in-process.
+#   wasm        — `cargo check` for wasm32-unknown-unknown and wasm32-wasip1.
+#                 The former has no clock, and `SystemTime::now` panics there,
+#                 so this guards the fallback in `now_ms`.
+#   features    — every feature flag is off by default and each pulls its own
+#                 dependencies, so each combination is checked separately to
+#                 catch a `cfg`-gated import that only breaks when a feature is
+#                 absent.
+#   msrv        — the declared `rust-version` must actually build.
+#   package     — `cargo package`, which catches manifest problems that only
+#                 surface at publish time (a missing README, an excluded file
+#                 something still references).
+
+name: Test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint, Format & Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: lint
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (all targets, all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # nextest does not run doctests, and the examples document a crate whose
+      # misuse fork-bombs the host, so they are kept compiling.
+      - name: Run doctests
+        run: cargo test --doc --all-features
+
+  # ─────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: test-${{ matrix.os }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Run tests
+        run: cargo nextest run --all-features --no-fail-fast
+
+  # ─────────────────────────────────────────────────────────────────────────
+  wasm:
+    name: WASM / WASI check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-unknown-unknown, wasm32-wasip1]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: wasm-${{ matrix.target }}
+
+      # Default features only: `native-crash` and `shared-ring` are host-only.
+      - name: cargo check --lib
+        run: cargo check --target ${{ matrix.target }} --lib
+
+  # ─────────────────────────────────────────────────────────────────────────
+  features:
+    name: Feature matrix (${{ matrix.flags }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flags:
+          - "" # default features
+          - "--features tracing"
+          - "--features shared-ring"
+          - "--features native-crash"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: features
+
+      - name: cargo check
+        run: cargo check --lib --bins --tests ${{ matrix.flags }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Must match `rust-version` in Cargo.toml.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: msrv
+
+      - name: cargo check
+        run: cargo check --all-features --all-targets
+
+  # ─────────────────────────────────────────────────────────────────────────
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: package
+
+      - name: cargo package
+        run: cargo package --all-features
