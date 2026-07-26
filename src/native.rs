@@ -29,10 +29,9 @@
 //! feature). The in-process recorder cannot: it dies with the process, and a
 //! signal handler could not read it anyway because it sits behind a `Mutex`.
 //! The shared ring is a memory-mapped file written without locks, so it
-//! outlives the crash and the monitor reads it from outside — see
-//! [`MonitorHandler::recover_trail`]. Without that feature a native-crash
-//! report carries no trail, which is a property of out-of-process capture
-//! rather than of the schema.
+//! outlives the crash and the monitor reads it from outside. Without that
+//! feature a native-crash report carries no trail, which is a property of
+//! out-of-process capture rather than of the schema.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

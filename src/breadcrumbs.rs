@@ -87,7 +87,7 @@ pub(crate) fn init(capacity: usize) {
     });
 }
 
-/// The global recorder, if [`init`] has run.
+/// The global recorder, if [`crate::init`] has run.
 #[must_use]
 pub fn recorder() -> Option<&'static Recorder> {
     RECORDER.get()
