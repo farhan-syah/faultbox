@@ -557,6 +557,20 @@ impl DirLock {
         // The critical section is a small read-modify-write of two JSON files —
         // bulk artifact copying happens outside it — so a live holder is never
         // close to the staleness window.
+        // When the lock file is *deleted* rather than merely present, Windows
+        // reports a third outcome that is neither success nor `AlreadyExists`.
+        // A waiter stat-ing the lock holds an open handle to it, so the holder's
+        // `remove_file` only marks the name delete-pending; every `CREATE_NEW`
+        // against that name fails with `ACCESS_DENIED` until the last handle
+        // closes. Treating that as fatal is what dropped captures on a
+        // contended Windows runner: six processes polling one lock every 5ms
+        // means a waiter almost always has the file open at the instant the
+        // holder releases it.
+        //
+        // So a sharing error is retried like contention, but only for as long
+        // as a delete can plausibly stay pending. Past that it is a real
+        // permission problem — an unwritable directory — and must surface.
+        let mut sharing_since: Option<std::time::Instant> = None;
         loop {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -568,9 +582,16 @@ impl DirLock {
                     return Ok(DirLock { path });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
-                        let _ = std::fs::remove_file(&path);
+                    sharing_since = None;
+                    if lock_is_stale(&path) && std::fs::remove_file(&path).is_ok() {
                         continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) if is_sharing_error(&e) => {
+                    let since = sharing_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed().as_millis() > LOCK_STALE_MS {
+                        return Err(e);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
@@ -578,6 +599,25 @@ impl DirLock {
             }
         }
     }
+}
+
+/// Whether an error is Windows' "another process is using this file" family:
+/// `ACCESS_DENIED` on a delete-pending name, `SHARING_VIOLATION`, or
+/// `LOCK_VIOLATION`. All are transient — they clear when the other process
+/// closes its handle.
+///
+/// Windows-only by construction. On unix a `PermissionDenied` means exactly
+/// what it says: the directory is not writable, and retrying it would stall
+/// every capture for the retry budget before failing anyway.
+fn is_sharing_error(e: &io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    cfg!(windows)
+        && (e.kind() == io::ErrorKind::PermissionDenied
+            || matches!(
+                e.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+            ))
 }
 
 fn lock_is_stale(path: &Path) -> bool {
@@ -621,7 +661,7 @@ fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     for _ in 0..100 {
         // Only a sharing violation is worth retrying; anything else is a real
         // failure and retrying would just delay it.
-        if err.kind() != io::ErrorKind::PermissionDenied {
+        if !is_sharing_error(&err) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1000,6 +1040,17 @@ mod tests {
         // Must not hang: a dead holder cannot wedge the group forever.
         let lock = DirLock::acquire(&dir).unwrap();
         drop(lock);
+    }
+
+    #[test]
+    fn sharing_errors_are_retryable_only_where_they_exist() {
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        // Windows: a delete-pending lock name reports `ACCESS_DENIED`, and
+        // giving up on it drops a capture. Unix: it means an unwritable
+        // directory, and retrying only delays the inevitable failure.
+        assert_eq!(is_sharing_error(&denied), cfg!(windows));
+        // Never a reason to retry anywhere.
+        assert!(!is_sharing_error(&io::Error::from(io::ErrorKind::NotFound)));
     }
 
     fn sample_report() -> Report {
