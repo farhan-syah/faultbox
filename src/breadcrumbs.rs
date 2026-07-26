@@ -35,13 +35,18 @@ pub struct Breadcrumb {
     /// Unix-epoch milliseconds when recorded.
     pub ts_ms: u128,
     pub level: Level,
-    /// Coarse category, e.g. `"pagedb.commit"`, `"pagedb.free"`.
+    /// Coarse category, e.g. `"myapp.commit"`, `"myapp.free"`.
     pub category: String,
     /// Human message (should already avoid user data; the writer redacts too).
     pub message: String,
     /// Structured fields. Keep small and free of user content.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub fields: serde_json::Value,
+    /// Which process recorded this crumb. `None` for crumbs from this process's
+    /// own recorder (they are all this process); `Some` for crumbs read back
+    /// from a shared, artifact-keyed ring, where the origin is the whole point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// The process-wide recorder. Bounded; oldest-evicted.
@@ -90,6 +95,10 @@ pub fn recorder() -> Option<&'static Recorder> {
 
 /// Record a breadcrumb. A no-op if the recorder was never initialized, so
 /// libraries can emit crumbs unconditionally without coupling to app setup.
+///
+/// When a shared, artifact-keyed ring is configured (`shared-ring` feature),
+/// the crumb is written to it as well, so processes that later open the same
+/// artifact can see what this one did.
 pub fn record(
     level: Level,
     category: impl Into<String>,
@@ -97,12 +106,21 @@ pub fn record(
     fields: serde_json::Value,
 ) {
     let Some(rec) = RECORDER.get() else { return };
+    let category = category.into();
+    let message = message.into();
+
+    #[cfg(feature = "shared-ring")]
+    if let Some(ring) = crate::config().and_then(|c| c.shared_ring.as_ref()) {
+        ring.record(level, &category, &message);
+    }
+
     rec.record(Breadcrumb {
         ts_ms: crate::now_ms(),
         level,
-        category: category.into(),
-        message: message.into(),
+        category,
+        message,
         fields,
+        pid: None,
     });
 }
 
@@ -115,8 +133,8 @@ pub fn snapshot() -> Vec<Breadcrumb> {
 /// Emit a breadcrumb ergonomically.
 ///
 /// ```ignore
-/// blackbox::breadcrumb!(Info, "pagedb.commit", "committed", { "commit_id": 9557 });
-/// blackbox::breadcrumb!(Warn, "pagedb.free", "freed chain");
+/// blackbox::breadcrumb!(Info, "myapp.commit", "committed", { "commit_id": 9557 });
+/// blackbox::breadcrumb!(Warn, "myapp.free", "freed chain");
 /// ```
 #[macro_export]
 macro_rules! breadcrumb {
@@ -155,6 +173,7 @@ mod tests {
                 category: "t".to_owned(),
                 message: format!("m{i}"),
                 fields: serde_json::Value::Null,
+                pid: None,
             });
         }
         let snap = rec.snapshot();

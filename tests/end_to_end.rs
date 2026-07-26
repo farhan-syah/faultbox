@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! End-to-end: model the real pagedb corruption this crate was designed for —
-//! record operation breadcrumbs, then capture a corruption report with domain
-//! forensic context and a preserved snapshot of the bad store — and verify the
-//! on-disk report is complete and reloadable.
+//! End-to-end: model the corruption case this crate was designed for — record
+//! operation breadcrumbs, then capture a corruption report with domain forensic
+//! context and a preserved snapshot of the bad store — and verify the on-disk
+//! report is complete and reloadable.
 
 use blackbox::{Capture, Config, DomainContext, EventKind, Report};
 
-/// The forensic context pagedb would attach at the dangling-child detection
-/// site (mirrors the real `pagedb-fsck` finding).
+/// The forensic context a storage engine would attach at a dangling-child
+/// detection site.
 struct DanglingChild {
     parent: u64,
     child: u64,
@@ -17,7 +17,7 @@ struct DanglingChild {
 
 impl DomainContext for DanglingChild {
     fn domain_kind(&self) -> &'static str {
-        "pagedb.dangling_child"
+        "store.dangling_child"
     }
     fn grouping_key(&self) -> String {
         // Groups by failure class, NOT the specific page ids.
@@ -40,15 +40,15 @@ fn corruption_report_is_captured_with_context_breadcrumbs_and_artifact() {
 
     // Init once (no panic hook in tests).
     assert!(blackbox::init(
-        Config::new("pagedb", "0.1.0", &reports_dir)
+        Config::new("myapp", "0.1.0", &reports_dir)
             .git_sha("deadbeefcafe")
             .install_panic_hook(false),
     ));
 
     // Operation trail leading up to the failure — the flight recorder.
-    blackbox::breadcrumb!(Info, "pagedb.reopen", "opened store", { "commit_id": 9557 });
-    blackbox::breadcrumb!(Debug, "pagedb.free", "released overflow chain", { "root": 6050 });
-    blackbox::breadcrumb!(Info, "pagedb.commit", "committed", { "commit_id": 9558 });
+    blackbox::breadcrumb!(Info, "myapp.reopen", "opened store", { "commit_id": 9557 });
+    blackbox::breadcrumb!(Debug, "myapp.free", "released overflow chain", { "root": 6050 });
+    blackbox::breadcrumb!(Info, "myapp.commit", "committed", { "commit_id": 9558 });
 
     // A fake corrupt store to preserve for offline fsck.
     let store = tmp.path().join("db");
@@ -69,10 +69,10 @@ fn corruption_report_is_captured_with_context_breadcrumbs_and_artifact() {
     .domain(&ctx)
     .with_backtrace()
     .preserve(
-        "pagedb-store",
+        "store-snapshot",
         &store,
         "store.corrupt",
-        Some("inspect with: pagedb-fsck <dir> --deep --realm 00..0".to_owned()),
+        Some("inspect with an offline consistency checker".to_owned()),
     )
     .emit()
     .expect("report emitted");
@@ -82,7 +82,7 @@ fn corruption_report_is_captured_with_context_breadcrumbs_and_artifact() {
     let report: Report = serde_json::from_str(&text).unwrap();
 
     assert_eq!(report.kind, EventKind::Corruption);
-    assert_eq!(report.meta.project, "pagedb");
+    assert_eq!(report.meta.project, "myapp");
     assert_eq!(report.meta.git_sha.as_deref(), Some("deadbeefcafe"));
     assert_eq!(report.error_chain.len(), 2);
 
@@ -92,23 +92,23 @@ fn corruption_report_is_captured_with_context_breadcrumbs_and_artifact() {
 
     // The flight-recorder trail is present, oldest-first.
     assert_eq!(report.breadcrumbs.len(), 3);
-    assert_eq!(report.breadcrumbs[0].category, "pagedb.reopen");
+    assert_eq!(report.breadcrumbs[0].category, "myapp.reopen");
     assert_eq!(report.breadcrumbs[2].fields["commit_id"], 9558);
 
     // The corrupt store was copied in beside the report.
     assert_eq!(report.artifacts.len(), 1);
-    assert_eq!(report.artifacts[0].kind, "pagedb-store");
+    assert_eq!(report.artifacts[0].kind, "store-snapshot");
     assert!(dir.join("store.corrupt/main.db").is_file());
 
     // Fingerprint is stable and groups by (site, failure class), independent of
     // the specific page ids or message — a different report at the same site
     // with the same child-kind must land in the same group.
     let fp_other_pages = blackbox::writer::fingerprint(
-        "pagedb",
+        "myapp",
         EventKind::Corruption,
-        "pagedb.dangling_child|child_kind=0x09",
+        "store.dangling_child|child_kind=0x09",
         "some other message with page 999",
     );
     assert_eq!(report.fingerprint, fp_other_pages);
-    assert_eq!(report.domain_kind.as_deref(), Some("pagedb.dangling_child"));
+    assert_eq!(report.domain_kind.as_deref(), Some("store.dangling_child"));
 }

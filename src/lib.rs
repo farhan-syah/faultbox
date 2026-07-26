@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `blackbox` — a production black-box recorder for the NodeDB-lab projects.
+//! `blackbox` — a production black-box recorder.
 //!
 //! One report format for every failure class — Rust panics, native crashes,
 //! detected data corruption, and invariant violations — each carrying a
@@ -32,15 +32,23 @@ pub mod context;
 #[cfg(feature = "native-crash")]
 pub mod native;
 pub mod panic;
+pub mod reader;
 pub mod report;
+#[cfg(feature = "shared-ring")]
+pub mod shared_ring;
+#[cfg(feature = "tracing")]
+pub mod tracing_layer;
 pub mod writer;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use context::{Adhoc, DomainContext, NoopRedactor, Redactor};
+pub use context::{Adhoc, BasicRedactor, DomainContext, NoopRedactor, Redactor};
 pub use report::{Artifact, Env, EventKind, Frame, Meta, Report, SCHEMA_VERSION};
+#[cfg(feature = "tracing")]
+pub use tracing_layer::BreadcrumbLayer;
+pub use writer::Retention;
 
 /// Re-exported so adopters can build [`DomainContext::to_json`] payloads
 /// (`blackbox::serde_json::json!{…}`) without taking their own dependency.
@@ -48,7 +56,7 @@ pub use serde_json;
 
 /// Process-wide configuration, set once via [`init`].
 pub struct Config {
-    /// Adopting project name, e.g. `"pagedb"`.
+    /// Adopting project name, e.g. `"myapp"`.
     pub project: String,
     /// Package semver.
     pub version: String,
@@ -57,19 +65,50 @@ pub struct Config {
     pub git_sha: Option<String>,
     /// GNU build-id; defaults to the running binary's via [`build_id::read_self`].
     pub build_id: Option<String>,
-    /// Directory reports are written under, e.g. `~/.pagedb/crash-reports`.
+    /// Directory reports are written under, e.g. `~/.myapp/crash-reports`.
     pub reports_dir: PathBuf,
     /// Flight-recorder capacity (number of breadcrumbs retained).
     pub breadcrumb_capacity: usize,
+    /// Compile-time feature flags worth recording on every report — the build's
+    /// feature selection is often what separates a reproducible failure from an
+    /// unreproducible one.
+    pub features: Vec<String>,
+    /// How much history the reports directory keeps. Enforced after every
+    /// [`Capture::emit`] so a crash loop cannot fill the disk.
+    pub retention: writer::Retention,
+    /// Largest artifact [`Capture::preserve`] will copy. A larger source is
+    /// left in place and the omission is noted on the report rather than
+    /// silently filling the disk.
+    pub preserve_max_bytes: u64,
     /// Redactor applied to every string entering a report. Defaults to a no-op;
     /// production adopters MUST supply a real one.
     pub redactor: Box<dyn Redactor>,
+    /// An optional breadcrumb ring in shared memory, keyed to the artifact
+    /// rather than this process (`shared-ring` feature).
+    ///
+    /// When set, crumbs are recorded to both the in-process recorder and this
+    /// ring, and reports carry the two trails merged by timestamp — so a
+    /// corruption detected here can show the writes that caused it *in another
+    /// process*. Open one per store, e.g. at `<store>/.blackbox-ring`.
+    #[cfg(feature = "shared-ring")]
+    pub shared_ring: Option<std::sync::Arc<shared_ring::SharedRing>>,
     /// Whether [`init`] installs the panic hook.
     pub install_panic_hook: bool,
     /// Whether [`init`] installs the out-of-process native-crash handler
-    /// (`native-crash` feature only). Requires the host to call
-    /// [`run_crash_monitor_if_env`] at the top of `main`. Defaults to `true`
-    /// when the feature is compiled in.
+    /// (`native-crash` feature only).
+    ///
+    /// **Defaults to `false`, and must be opted into explicitly**, because
+    /// arming it imposes a hard requirement on the host: `main` *must* call
+    /// [`run_crash_monitor_if_env`] before doing anything else. The monitor is a
+    /// re-exec of the host binary, so if that call is missing the spawned child
+    /// does not become a monitor — it runs the application again from the top,
+    /// calls `init` again, and spawns another child. That is an exponential
+    /// fork bomb, and it is not hypothetical: it is what happens the first time
+    /// anyone enables the feature and forgets the call.
+    ///
+    /// Enabling the `native-crash` Cargo feature therefore does *not* arm this
+    /// on its own — a feature flag can be turned on transitively by a
+    /// dependency, and no dependency can make the host's `main` cooperate.
     pub install_native_crash_handler: bool,
 }
 
@@ -88,9 +127,19 @@ impl Config {
             build_id: build_id::read_self(),
             reports_dir: reports_dir.into(),
             breadcrumb_capacity: 128,
+            features: Vec::new(),
+            retention: writer::Retention::default(),
+            // 256 MiB: big enough for a realistic corrupt store, small enough
+            // that a handful of them cannot fill a user's disk.
+            preserve_max_bytes: 256 * 1024 * 1024,
             redactor: Box::new(NoopRedactor),
+            #[cfg(feature = "shared-ring")]
+            shared_ring: None,
             install_panic_hook: true,
-            install_native_crash_handler: cfg!(feature = "native-crash"),
+            // Off by default — see the field docs. Arming this without the
+            // matching `run_crash_monitor_if_env()` call in `main` fork-bombs
+            // the host.
+            install_native_crash_handler: false,
         }
     }
 
@@ -106,9 +155,41 @@ impl Config {
         self
     }
 
+    /// Record the build's enabled feature flags on every report.
+    #[must_use]
+    pub fn features<I, S>(mut self, features: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.features = features.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn retention(mut self, retention: writer::Retention) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    #[must_use]
+    pub fn preserve_max_bytes(mut self, bytes: u64) -> Self {
+        self.preserve_max_bytes = bytes;
+        self
+    }
+
     #[must_use]
     pub fn redactor(mut self, redactor: Box<dyn Redactor>) -> Self {
         self.redactor = redactor;
+        self
+    }
+
+    /// Attach a shared-memory breadcrumb ring keyed to the artifact, so reports
+    /// can carry crumbs recorded by *other* processes touching the same store.
+    #[cfg(feature = "shared-ring")]
+    #[must_use]
+    pub fn shared_ring(mut self, ring: std::sync::Arc<shared_ring::SharedRing>) -> Self {
+        self.shared_ring = Some(ring);
         self
     }
 
@@ -152,12 +233,33 @@ pub fn init(config: Config) -> bool {
 }
 
 /// Divert to the native-crash monitor loop when this process was spawned as one
-/// (the `native-crash` feature's monitor). Call at the very top of `main`,
-/// before any argument parsing. Returns `false` in a normal process; in the
-/// monitor it runs to completion and exits without returning.
+/// (the `native-crash` feature's monitor). Returns `false` in a normal process;
+/// in the monitor it runs to completion and exits without returning.
+///
+/// **Call this as the first statement in `main`**, before argument parsing or
+/// any other work, whenever [`Config::install_native_crash_handler`] is enabled:
+///
+/// ```no_run
+/// fn main() {
+///     if blackbox::run_crash_monitor_if_env() {
+///         return;
+///     }
+///     // ...normal startup
+/// }
+/// ```
+///
+/// The monitor is a re-exec of this same binary, so this call is what
+/// distinguishes "I am the monitor" from "I am the application". Omitting it
+/// while the handler is armed makes every spawned monitor start the application
+/// again — which spawns another monitor, exponentially. [`init`] detects that
+/// situation and aborts the duplicate rather than letting it multiply, but the
+/// only correct fix is this call.
 ///
 /// A no-op returning `false` when the `native-crash` feature is disabled, so the
 /// call site stays identical regardless of feature selection.
+// The example deliberately spells out `fn main`: *where* in `main` this call
+// goes is the thing being documented, and a fragment cannot show that.
+#[allow(clippy::needless_doctest_main)]
 #[must_use]
 pub fn run_crash_monitor_if_env() -> bool {
     #[cfg(feature = "native-crash")]
@@ -280,6 +382,10 @@ impl Capture {
     /// Build, persist, and return the report directory. Returns `None` if the
     /// recorder was never [`init`]ialized or the write failed — never panics,
     /// so it is safe inside a panic hook.
+    ///
+    /// Reports **coalesce by fingerprint**: repeated captures of one bug land in
+    /// the same directory, bumping [`Report::occurrences`] and refreshing
+    /// `latest.json`, rather than writing a directory per occurrence.
     #[must_use]
     pub fn emit(self) -> Option<PathBuf> {
         let cfg = CONFIG.get()?;
@@ -293,7 +399,7 @@ impl Capture {
             .collect();
         let mut domain = self.domain;
         redactor.redact_json(&mut domain);
-        let breadcrumbs = redacted_breadcrumbs(redactor);
+        let breadcrumbs = redacted_breadcrumbs(cfg, redactor);
 
         // Fingerprint by (project, kind, detection site, failure-class key) so
         // the same bug at the same site collapses to one group, while distinct
@@ -304,6 +410,7 @@ impl Capture {
         };
         let fingerprint = writer::fingerprint(&cfg.project, self.kind, &domain_facet, &message);
 
+        let now = now_ms();
         let mut report = Report {
             schema_version: SCHEMA_VERSION,
             kind: self.kind,
@@ -313,58 +420,111 @@ impl Capture {
                 version: cfg.version.clone(),
                 git_sha: cfg.git_sha.clone(),
                 build_id: cfg.build_id.clone(),
-                captured_at_ms: now_ms(),
+                captured_at_ms: now,
                 pid: std::process::id(),
+                ppid: Meta::current_ppid(),
+                thread: Meta::current_thread_name(),
             },
             error_chain,
             backtrace: self.backtrace,
             breadcrumbs,
             domain_kind: self.domain_kind,
             domain,
-            env: Env::current(),
+            env: Env::with_features(cfg.features.clone()),
             artifacts: Vec::new(),
             fingerprint,
+            occurrences: 1,
+            first_seen_ms: now,
+            last_seen_ms: now,
         };
 
-        let dir = writer::report_dir_for(&cfg.reports_dir, &report).ok()?;
+        // Hold the group lock across the whole read-modify-write: a supervisor
+        // restarting a crashing daemon has several processes racing on exactly
+        // this directory.
+        let (dir, _lock) = writer::open_group(&cfg.reports_dir, &report.fingerprint).ok()?;
+
         for pending in &self.artifacts {
-            // Cross-process dedup: if an earlier report of this same fingerprint
-            // already preserved an identical snapshot, reference it instead of
-            // re-copying. Without this, a corrupt-store crash-loop balloons the
-            // reports directory with duplicate multi-MB copies.
-            if let Some(rel) = writer::find_preserved_sibling(
-                &cfg.reports_dir,
-                &report.fingerprint,
-                &pending.name,
-                &dir,
-            ) {
-                report.artifacts.push(Artifact {
-                    kind: pending.kind.clone(),
-                    rel_path: rel.to_string_lossy().into_owned(),
-                    note: Some(match &pending.note {
-                        Some(n) => format!("{n} (deduplicated: shared with an earlier report)"),
-                        None => "deduplicated: shared with an earlier report".to_owned(),
-                    }),
-                });
-                continue;
-            }
-            match writer::preserve_artifact(&dir, &pending.src, &pending.name) {
-                Ok(rel) => report.artifacts.push(Artifact {
-                    kind: pending.kind.clone(),
-                    rel_path: rel,
-                    note: pending.note.clone(),
-                }),
-                Err(_) => { /* best-effort: a missing artifact must not lose the report */ }
-            }
+            report
+                .artifacts
+                .push(preserve_pending(&dir, pending, cfg.preserve_max_bytes));
         }
-        writer::write_report_json(&dir, &report).ok()?;
+
+        writer::commit_into(&dir, &mut report).ok()?;
+        writer::prune(&cfg.reports_dir, cfg.retention, &dir);
         Some(dir)
     }
 }
 
-/// Snapshot the flight recorder and redact each crumb's message + fields.
-fn redacted_breadcrumbs(redactor: &dyn Redactor) -> Vec<breadcrumbs::Breadcrumb> {
+/// Preserve one pending artifact, turning every outcome — including failure and
+/// refusal — into an [`Artifact`] entry. An artifact that could not be captured
+/// is recorded as such, because an analyst reading the report needs to know the
+/// snapshot is missing rather than infer it from an absent field.
+fn preserve_pending(dir: &std::path::Path, pending: &PendingArtifact, max_bytes: u64) -> Artifact {
+    let note_with = |extra: &str| {
+        Some(match &pending.note {
+            Some(n) => format!("{n} ({extra})"),
+            None => extra.to_owned(),
+        })
+    };
+    match writer::preserve_artifact(dir, &pending.src, &pending.name, max_bytes) {
+        Ok(writer::Preserved::Copied { rel, bytes, digest }) => Artifact {
+            kind: pending.kind.clone(),
+            rel_path: rel,
+            note: pending.note.clone(),
+            digest: Some(digest),
+            bytes: Some(bytes),
+        },
+        Ok(writer::Preserved::Reused { rel, bytes, digest }) => Artifact {
+            kind: pending.kind.clone(),
+            rel_path: rel,
+            note: note_with("unchanged since an earlier occurrence of this bug"),
+            digest: Some(digest),
+            bytes: Some(bytes),
+        },
+        Ok(writer::Preserved::TooLarge { bytes, limit }) => Artifact {
+            kind: pending.kind.clone(),
+            rel_path: String::new(),
+            note: note_with(&format!(
+                "NOT PRESERVED: {bytes} bytes exceeds the {limit}-byte cap; \
+                 the source was left in place at {}",
+                pending.src.display()
+            )),
+            digest: None,
+            bytes: Some(bytes),
+        },
+        Err(e) => Artifact {
+            kind: pending.kind.clone(),
+            rel_path: String::new(),
+            note: note_with(&format!("NOT PRESERVED: {e}")),
+            digest: None,
+            bytes: None,
+        },
+    }
+}
+
+/// Snapshot the flight recorder — merged with the shared, artifact-keyed ring
+/// when one is configured — and redact each crumb's message and fields.
+///
+/// Crumbs this process recorded appear in *both* rings (they are written to
+/// both), so the shared ring's contribution is restricted to *other* processes.
+/// Those are the ones the local recorder structurally cannot know about, and
+/// the reason the shared ring exists: the writes that caused a corruption
+/// usually happened somewhere else.
+fn redacted_breadcrumbs(_cfg: &Config, redactor: &dyn Redactor) -> Vec<breadcrumbs::Breadcrumb> {
     let mut crumbs = breadcrumbs::snapshot();
+
+    #[cfg(feature = "shared-ring")]
+    if let Some(ring) = &_cfg.shared_ring {
+        let me = std::process::id();
+        crumbs.extend(
+            ring.snapshot()
+                .into_iter()
+                .filter(|c| c.pid != Some(me) && c.pid.is_some()),
+        );
+        // Interleave the two trails into one causal sequence.
+        crumbs.sort_by_key(|c| c.ts_ms);
+    }
+
     for c in &mut crumbs {
         c.message = redactor.redact(&c.message);
         redactor.redact_json(&mut c.fields);
@@ -421,5 +581,26 @@ mod tests {
     #[test]
     fn now_ms_is_positive() {
         assert!(now_ms() > 0);
+    }
+
+    /// Regression guard for a fork bomb.
+    ///
+    /// The native-crash monitor is a re-exec of the host binary that only
+    /// becomes a monitor if `main` calls `run_crash_monitor_if_env()`. When this
+    /// defaulted to `true`, merely enabling the Cargo feature armed it — so any
+    /// host without that call (every test binary, for one) spawned a child that
+    /// re-ran the application, which spawned another child, exponentially. It
+    /// produced 2000+ runaway processes on the first run.
+    ///
+    /// Arming it must stay an explicit, deliberate opt-in, regardless of which
+    /// Cargo features happen to be enabled.
+    #[test]
+    fn native_crash_handler_is_never_armed_by_default() {
+        let cfg = Config::new("t", "0.1.0", "/tmp/blackbox-test-reports");
+        assert!(
+            !cfg.install_native_crash_handler,
+            "enabling the `native-crash` feature must not arm the handler; \
+             the host must opt in *and* call run_crash_monitor_if_env()"
+        );
     }
 }

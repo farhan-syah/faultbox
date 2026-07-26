@@ -26,6 +26,17 @@ all-features = true
 # default so the base recorder (panics, corruption, invariants) stays lean.
 native-crash = ["dep:crash-handler", "dep:minidumper"]
 
+# Feed the flight recorder from `tracing` events, so a project that already
+# instruments with `tracing` gets a breadcrumb trail with no manual
+# `breadcrumb!` calls. Off by default so the base crate stays dependency-light.
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
+
+# A breadcrumb ring in shared memory, keyed to the artifact rather than the
+# process. Lets a corruption *detected* by one process carry the writes that
+# *caused* it in another — the concurrent-open case a per-process ring can
+# never explain.
+shared-ring = ["dep:memmap2"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +46,21 @@ serde_json = "1"
 # crashed process; crash-handler installs the async-signal-safe crash hooks.
 crash-handler = { version = "0.8", optional = true }
 minidumper = { version = "0.11", optional = true }
+
+# `tracing` bridge (optional; enabled by the `tracing` feature). Only the
+# `registry` piece of tracing-subscriber is needed — no formatter, no filter
+# engine — so the adopter's own subscriber stack is left entirely alone.
+tracing = { version = "0.1", optional = true, default-features = false, features = [
+    "std",
+] }
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
+    "registry",
+    "std",
+] }
+
+# Shared-memory breadcrumb ring (optional; enabled by the `shared-ring`
+# feature).
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

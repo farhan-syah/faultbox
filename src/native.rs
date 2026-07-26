@@ -67,6 +67,13 @@ pub fn run_crash_monitor_if_env() -> bool {
     let Ok(socket) = std::env::var(ENV_SOCKET) else {
         return false;
     };
+    // Clear the marker before doing anything else so that any process the
+    // monitor itself spawns does not inherit monitor mode and mistake itself
+    // for a failed-to-divert child.
+    //
+    // SAFETY: this runs at the very top of `main`, before the program has
+    // started any threads, so there is no concurrent reader of the environment.
+    unsafe { std::env::remove_var(ENV_SOCKET) };
     let code = run_monitor(&socket);
     std::process::exit(code);
 }
@@ -77,6 +84,29 @@ pub fn run_crash_monitor_if_env() -> bool {
 pub fn install(cfg: &crate::Config) {
     if GUARD.get().is_some() {
         return;
+    }
+
+    // Reaching here with `ENV_SOCKET` set means this process *is* a spawned
+    // monitor whose host never called `run_crash_monitor_if_env()` — so instead
+    // of running the server loop it fell through into the application's normal
+    // startup, and is now about to spawn a monitor of its own. Each generation
+    // would double, and the host would be fork-bombed by its own crash
+    // reporter.
+    //
+    // Refuse, and exit: a duplicate instance of the application is strictly
+    // worse than a missing crash handler. For a daemon it means two processes
+    // bound to the same port and writing the same store — this crate causing
+    // exactly the corruption it exists to report on.
+    if std::env::var_os(ENV_SOCKET).is_some() {
+        eprintln!(
+            "blackbox: FATAL — this process was spawned as the crash monitor, but \
+             `blackbox::run_crash_monitor_if_env()` was never called, so it resumed \
+             normal startup as a duplicate instance of the application.\n\
+             blackbox: add this as the first statement in `main`:\n\
+             blackbox:     if blackbox::run_crash_monitor_if_env() {{ return; }}\n\
+             blackbox: exiting to avoid spawning further copies."
+        );
+        std::process::exit(70);
     }
     match try_install(cfg) {
         Ok(guard) => {
@@ -124,10 +154,29 @@ fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
         // to the app's group, and outlives a shell that backgrounded the app.
         cmd.process_group(0);
     }
-    let _child = cmd.spawn().map_err(|e| format!("spawn monitor: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn monitor: {e}"))?;
 
     // Connect to the monitor, retrying while it binds the socket.
-    let client = connect_with_retry(&socket)?;
+    //
+    // If this fails the child must be killed, not leaked. The monitor is a
+    // re-exec of the host binary, and it only diverts into the server loop
+    // because `run_crash_monitor_if_env` runs at the top of `main`. A host that
+    // forgot that call — or a child that failed to bind — is instead a *second
+    // full instance of the application*, which for a daemon means a second
+    // process contending for the same ports and the same store. Leaving it
+    // running would make this crate the cause of the corruption it exists to
+    // report.
+    let client = match connect_with_retry(&socket) {
+        Ok(client) => client,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{e} — the monitor process was killed. Ensure `main` calls \
+                 `blackbox::run_crash_monitor_if_env()` before any other work."
+            ));
+        }
+    };
 
     // Install the crash handler. Its closure asks the monitor to dump on a
     // crash; the boolean tells crash-handler whether we handled it.
@@ -217,14 +266,27 @@ impl MonitorHandler {
         }
     }
 
-    /// Build a native-crash report referencing `minidump` (already inside
-    /// `report_dir`, named `minidump`) and write it out.
-    fn write_report(&self, report_dir: &std::path::Path) {
+    /// The message and fingerprint every native crash of this build shares.
+    ///
+    /// Finer grouping by faulting frame is deliberately an offline step against
+    /// the minidump + build-id: the monitor cannot symbolicate, and guessing
+    /// here would scatter one bug across many groups.
+    fn crash_fingerprint(&self) -> (&'static str, String) {
         let message = "native crash captured out-of-process (see minidump)";
-        // All native crashes for a build group together here; finer grouping by
-        // faulting frame is an offline step against the minidump + build-id.
-        let fingerprint = writer::fingerprint(&self.project, EventKind::NativeCrash, "", message);
-        let report = Report {
+        (
+            message,
+            writer::fingerprint(&self.project, EventKind::NativeCrash, "", message),
+        )
+    }
+
+    /// Build a native-crash report referencing `minidump` (already inside
+    /// `report_dir`, named `minidump`) and commit it into the group.
+    fn write_report(&self, report_dir: &std::path::Path) {
+        let (message, fingerprint) = self.crash_fingerprint();
+        let now = crate::now_ms();
+        let (bytes, digest) = writer::digest_of(&report_dir.join("minidump"))
+            .map_or((None, None), |(b, d)| (Some(b), Some(d)));
+        let mut report = Report {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::NativeCrash,
             message: message.to_owned(),
@@ -233,8 +295,10 @@ impl MonitorHandler {
                 version: self.version.clone(),
                 git_sha: self.git_sha.clone(),
                 build_id: self.build_id.clone(),
-                captured_at_ms: crate::now_ms(),
+                captured_at_ms: now,
                 pid: std::process::id(),
+                ppid: Meta::current_ppid(),
+                thread: None,
             },
             error_chain: Vec::new(),
             backtrace: Vec::new(),
@@ -250,23 +314,26 @@ impl MonitorHandler {
                      build-id's symbols"
                         .to_owned(),
                 ),
+                digest,
+                bytes,
             }],
             fingerprint,
+            occurrences: 1,
+            first_seen_ms: now,
+            last_seen_ms: now,
         };
-        let _ = writer::write_report_json(report_dir, &report);
+        let _ = writer::commit_into(report_dir, &mut report);
     }
 }
 
 impl minidumper::ServerHandler for MonitorHandler {
     fn create_minidump_file(&self) -> Result<(std::fs::File, PathBuf), std::io::Error> {
-        // Pre-create the report directory so the minidump lands directly inside
+        // Pre-create the group directory so the minidump lands directly inside
         // it as `minidump`; the report.json is written in `on_minidump_created`.
-        let message = "native crash captured out-of-process (see minidump)";
-        let fingerprint = writer::fingerprint(&self.project, EventKind::NativeCrash, "", message);
-        let fp8: String = fingerprint.chars().take(8).collect();
-        let dir = self
-            .reports_dir
-            .join(format!("{}-{}", crate::now_ms(), fp8));
+        // The group is keyed by fingerprint, so a crash loop overwrites one
+        // minidump and bumps a counter rather than filling the disk.
+        let (_, fingerprint) = self.crash_fingerprint();
+        let dir = writer::group_dir(&self.reports_dir, &fingerprint);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("minidump");
         let file = std::fs::File::create(&path)?;
@@ -312,7 +379,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let handler = MonitorHandler {
             reports_dir: tmp.path().to_path_buf(),
-            project: "ma8e".to_owned(),
+            project: "myapp".to_owned(),
             version: "0.1.0".to_owned(),
             git_sha: None,
             build_id: Some("deadbeef".to_owned()),
@@ -328,7 +395,7 @@ mod tests {
         let text = std::fs::read_to_string(report_dir.join("report.json")).unwrap();
         let report: Report = serde_json::from_str(&text).unwrap();
         assert_eq!(report.kind, EventKind::NativeCrash);
-        assert_eq!(report.meta.project, "ma8e");
+        assert_eq!(report.meta.project, "myapp");
         assert_eq!(report.meta.build_id.as_deref(), Some("deadbeef"));
         assert_eq!(report.artifacts.len(), 1);
         assert_eq!(report.artifacts[0].kind, "minidump");
@@ -339,11 +406,11 @@ mod tests {
     fn native_crash_reports_share_a_fingerprint_per_build() {
         // All native crashes for one project group together live (finer
         // grouping is an offline step against the minidump).
-        let a = writer::fingerprint("ma8e", EventKind::NativeCrash, "", "native crash captured");
-        let b = writer::fingerprint("ma8e", EventKind::NativeCrash, "", "native crash captured");
+        let a = writer::fingerprint("myapp", EventKind::NativeCrash, "", "native crash captured");
+        let b = writer::fingerprint("myapp", EventKind::NativeCrash, "", "native crash captured");
         assert_eq!(a, b);
         let other = writer::fingerprint(
-            "pagedb",
+            "otherapp",
             EventKind::NativeCrash,
             "",
             "native crash captured",

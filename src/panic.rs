@@ -29,17 +29,38 @@ pub(crate) fn frames_from_backtrace(bt: &Backtrace) -> Vec<Frame> {
         .collect()
 }
 
+thread_local! {
+    /// Guards against a panic *inside* the capture path re-entering this hook.
+    /// Without it, a panicking redactor or a failing allocation would recurse
+    /// until the stack is gone, replacing a diagnosable panic with a stack
+    /// overflow — destroying exactly the report we were trying to write.
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Install the panic hook. Called by [`crate::init`]; idempotent enough that a
 /// second install simply re-chains (harmless).
+///
+/// The capture is wrapped so that *nothing* it does can mask the original
+/// panic: re-entry is refused, and any panic raised while building or writing
+/// the report is swallowed. The previous hook always runs, so the process's
+/// existing behaviour (default message, abort, a custom hook) is unchanged
+/// whether or not the report succeeded.
 pub(crate) fn install_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
-        // Best-effort capture; a failure here must never mask the panic itself.
-        let message = panic_message(info);
-        let bt = Backtrace::force_capture();
-        let _ = crate::Capture::new(EventKind::Panic, message)
-            .backtrace_frames(frames_from_backtrace(&bt))
-            .emit();
+        let reentered = CAPTURING.with(|c| c.replace(true));
+        if !reentered {
+            // The capture path allocates, runs adopter-supplied redactor code,
+            // and touches the filesystem — all of which can panic.
+            let message = panic_message(info);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let bt = Backtrace::force_capture();
+                crate::Capture::new(EventKind::Panic, message)
+                    .backtrace_frames(frames_from_backtrace(&bt))
+                    .emit()
+            }));
+            CAPTURING.with(|c| c.set(false));
+        }
         // Preserve prior behaviour (default hook / abort / custom).
         previous(info);
     }));

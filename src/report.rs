@@ -7,15 +7,23 @@
 //! produce the same shape so downstream tooling (bug reports, symbolication,
 //! grouping) is uniform across every project that adopts `blackbox`.
 //!
-//! The schema is versioned ([`SCHEMA_VERSION`]): readers must tolerate unknown
-//! trailing fields and gate on the version before interpreting semantics.
+//! Pre-1.0, the shape defined here is the *only* supported shape. Reports are
+//! short-lived diagnostic artifacts, not durable user data, so the schema is
+//! changed in place as the crate learns what triage actually needs — no
+//! migrations, no compatibility shims, no reading of older layouts. Delete a
+//! stale reports directory rather than teaching the code to parse it.
 
 use serde::{Deserialize, Serialize};
 
 use crate::breadcrumbs::Breadcrumb;
 
-/// On-disk report schema version. Bump on any breaking shape change; add fields
-/// additively without a bump.
+/// On-disk report schema version, stamped into every report so a reader can
+/// tell at a glance which shape it is holding.
+///
+/// Pre-1.0 this stays at `1` and the shape simply evolves underneath it: the
+/// current code is always the latest and only schema. It is deliberately *not*
+/// bumped per change — versioning a format with a single in-tree consumer buys
+/// nothing and costs a migration path we would have to keep alive.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The failure class a report describes.
@@ -62,7 +70,7 @@ impl EventKind {
 /// symbolicate offline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
-    /// Adopting project name, e.g. `"pagedb"`.
+    /// Adopting project name, e.g. `"myapp"`.
     pub project: String,
     /// Package semver, e.g. `"0.1.0"`.
     pub version: String,
@@ -74,6 +82,39 @@ pub struct Meta {
     pub captured_at_ms: u128,
     /// Process id, for correlating with external logs.
     pub pid: u32,
+    /// Parent process id. Distinguishes a supervisor-restarted crash loop from
+    /// independent processes, and identifies the launcher of a rogue peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
+    /// Name of the thread the failure was detected on, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+}
+
+impl Meta {
+    /// Best-effort parent pid. `None` where the platform has no cheap answer.
+    #[must_use]
+    pub fn current_ppid() -> Option<u32> {
+        #[cfg(unix)]
+        {
+            // `getppid` is always successful and has no libc dependency here:
+            // read it from procfs where available, else fall back to `None`.
+            let stat = std::fs::read_to_string("/proc/self/status").ok()?;
+            stat.lines()
+                .find_map(|l| l.strip_prefix("PPid:"))
+                .and_then(|v| v.trim().parse().ok())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// The current thread's name, when it was given one.
+    #[must_use]
+    pub fn current_thread_name() -> Option<String> {
+        std::thread::current().name().map(str::to_owned)
+    }
 }
 
 /// A single frame's identity. Function names are present only when the build
@@ -93,12 +134,21 @@ pub struct Frame {
 /// corrupt store) that travels with the report for offline analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
-    /// Free-form kind, e.g. `"minidump"`, `"pagedb-store"`.
+    /// Free-form kind, e.g. `"minidump"`, `"store-snapshot"`.
     pub kind: String,
     /// Path relative to the report directory.
     pub rel_path: String,
-    /// Human note, e.g. how to inspect it (`"pagedb-fsck --deep …"`).
+    /// Human note, e.g. how to inspect it (`"fsck --deep …"`).
     pub note: Option<String>,
+    /// Content digest of the preserved bytes (see [`crate::writer::digest_of`]).
+    /// Lets a later occurrence prove it is looking at the *same* bad state
+    /// before reusing an existing snapshot, and lets an analyst confirm the
+    /// artifact was not altered in transit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Total size of the preserved artifact in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
 }
 
 /// Coarse host/runtime facts. Deliberately free of user data.
@@ -119,6 +169,17 @@ impl Env {
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             features: Vec::new(),
+        }
+    }
+
+    /// Capture the target facts alongside the adopter-declared feature flags
+    /// (see [`crate::Config::features`]) — the build's feature selection is
+    /// often what separates a reproducible failure from an unreproducible one.
+    #[must_use]
+    pub fn with_features(features: Vec<String>) -> Self {
+        Env {
+            features,
+            ..Env::current()
         }
     }
 }
@@ -143,7 +204,7 @@ pub struct Report {
     /// The flight-recorder trail leading up to the failure (already redacted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub breadcrumbs: Vec<Breadcrumb>,
-    /// The domain site tag (e.g. `"pagedb.dangling_child"`) when domain context
+    /// The domain site tag (e.g. `"store.dangling_child"`) when domain context
     /// was attached — records *where* the failure was detected, complementing
     /// the payload in [`domain`](Self::domain) and feeding the fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,8 +218,16 @@ pub struct Report {
     /// Preserved artifacts travelling with the report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<Artifact>,
-    /// Stable grouping/dedup key (see [`crate::fingerprint`]).
+    /// Stable grouping/dedup key (see [`crate::writer::fingerprint`]).
     pub fingerprint: String,
+    /// How many times this fingerprint has been captured into this report
+    /// directory. A crash loop re-detecting one bug increments this instead of
+    /// writing a fresh report directory per hit.
+    pub occurrences: u64,
+    /// Unix-epoch milliseconds of the first capture in this group.
+    pub first_seen_ms: u128,
+    /// Unix-epoch milliseconds of the most recent capture in this group.
+    pub last_seen_ms: u128,
 }
 
 #[cfg(test)]
@@ -172,12 +241,14 @@ mod tests {
             kind: EventKind::Corruption,
             message: "AEAD/MAC verification failed on read".to_owned(),
             meta: Meta {
-                project: "pagedb".to_owned(),
+                project: "myapp".to_owned(),
                 version: "0.1.0".to_owned(),
                 git_sha: Some("abc123".to_owned()),
                 build_id: Some("deadbeef".to_owned()),
                 captured_at_ms: 1,
                 pid: 42,
+                ppid: Some(7),
+                thread: Some("compactor".to_owned()),
             },
             error_chain: vec!["ChecksumFailure".to_owned()],
             backtrace: vec![Frame {
@@ -186,15 +257,20 @@ mod tests {
                 location: None,
             }],
             breadcrumbs: Vec::new(),
-            domain_kind: Some("pagedb.dangling_child".to_owned()),
+            domain_kind: Some("store.dangling_child".to_owned()),
             domain: serde_json::json!({ "page_id": 828, "kind": "0x09" }),
-            env: Env::current(),
+            env: Env::with_features(vec!["encryption".to_owned()]),
             artifacts: vec![Artifact {
-                kind: "pagedb-store".to_owned(),
+                kind: "store-snapshot".to_owned(),
                 rel_path: "store.corrupt".to_owned(),
-                note: Some("pagedb-fsck --deep".to_owned()),
+                note: Some("fsck --deep".to_owned()),
+                digest: Some("00ff00ff00ff00ff".to_owned()),
+                bytes: Some(4096),
             }],
             fingerprint: "ff00ff00".to_owned(),
+            occurrences: 3,
+            first_seen_ms: 1,
+            last_seen_ms: 900,
         };
 
         let json = serde_json::to_string(&report).unwrap();
@@ -202,7 +278,18 @@ mod tests {
         assert_eq!(back.kind, EventKind::Corruption);
         assert_eq!(back.domain["page_id"], 828);
         assert_eq!(back.artifacts.len(), 1);
+        assert_eq!(
+            back.artifacts[0].digest.as_deref(),
+            Some("00ff00ff00ff00ff")
+        );
         assert_eq!(back.fingerprint, "ff00ff00");
+        assert_eq!(back.meta.thread.as_deref(), Some("compactor"));
+        assert_eq!(back.meta.ppid, Some(7));
+        assert_eq!(back.env.features, vec!["encryption".to_owned()]);
+        assert_eq!(
+            (back.occurrences, back.first_seen_ms, back.last_seen_ms),
+            (3, 1, 900)
+        );
     }
 
     #[test]
@@ -212,12 +299,14 @@ mod tests {
             kind: EventKind::Panic,
             message: "boom".to_owned(),
             meta: Meta {
-                project: "ma8e".to_owned(),
+                project: "myapp".to_owned(),
                 version: "0.1.0".to_owned(),
                 git_sha: None,
                 build_id: None,
                 captured_at_ms: 0,
                 pid: 1,
+                ppid: None,
+                thread: None,
             },
             error_chain: Vec::new(),
             backtrace: Vec::new(),
@@ -227,6 +316,9 @@ mod tests {
             env: Env::current(),
             artifacts: Vec::new(),
             fingerprint: "0".to_owned(),
+            occurrences: 1,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
         };
         let json = serde_json::to_string(&report).unwrap();
         // Skipped-when-empty fields must not appear.
@@ -234,5 +326,7 @@ mod tests {
         assert!(!json.contains("breadcrumbs"));
         assert!(!json.contains("\"domain\""));
         assert!(!json.contains("artifacts"));
+        assert!(!json.contains("ppid"));
+        assert!(!json.contains("thread"));
     }
 }
