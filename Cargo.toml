@@ -15,9 +15,10 @@ keywords = ["crash", "diagnostics", "corruption", "reporting", "observability"]
 categories = ["development-tools::debugging"]
 authors = ["Farhan Syah"]
 resolver = "3"
-# The multi-process test helper binary and the tests that drive it are build-time
-# only. Excluding them keeps the published crate a pure library.
-exclude = ["src/bin", "tests/multiprocess.rs", ".claude"]
+# The multi-process test helper binary, the tests that drive it, and the CI
+# scripts are build-time only. Excluding them keeps the published crate a pure
+# library.
+exclude = ["src/bin", "tests/multiprocess.rs", ".claude", "scripts"]
 
 [package.metadata.docs.rs]
 all-features = true

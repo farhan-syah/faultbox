@@ -73,6 +73,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Must run before publishing: the manifest carries only the base version,
+      # so a prerelease tag would otherwise publish the base version instead.
+      - name: Set version from tag
+        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
+
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -92,7 +97,8 @@ jobs:
 
           # Verified here rather than trusting the prepare run's artifact: the
           # registry is what consumers get, and this is the last gate before it.
-          cargo publish --all-features
+          # `--allow-dirty` because the stamp step edits Cargo.toml in the tree.
+          cargo publish --all-features --allow-dirty
 
   # ── GitHub Release ─────────────────────────────────────────────────────────
   # Deliberately independent of publish-crate: a crates.io outage must not block

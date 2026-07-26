@@ -54,10 +54,14 @@ jobs:
         with:
           shared-key: release-package
 
+      - name: Set version from tag
+        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
+
       # `--all-features` so the packaged manifest is verified against the full
-      # dependency tree, which is what docs.rs will build.
+      # dependency tree, which is what docs.rs will build. `--allow-dirty`
+      # because the stamp above edits Cargo.toml in the working tree.
       - name: Package
-        run: cargo package --all-features
+        run: cargo package --all-features --allow-dirty
 
       - name: Show contents
         env:
