@@ -180,9 +180,31 @@ fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
 
     // Install the crash handler. Its closure asks the monitor to dump on a
     // crash; the boolean tells crash-handler whether we handled it.
-    // SAFETY: `make_crash_event` is unsafe because the closure runs in a signal
-    // context; it only calls `request_dump` (async-signal-safe IPC in
-    // minidumper) and returns — no allocation or unwinding.
+    //
+    // SAFETY: `make_crash_event` is unsafe because the closure body runs in a
+    // signal context, where only async-signal-safe operations are permitted —
+    // no allocation, no locks, no unwinding, no non-reentrant libc.
+    //
+    // The body is a single `request_dump` whose result is consumed by
+    // `is_ok()`. Audited against minidumper 0.11 on Linux, that path is:
+    //
+    //   1. `crash_context.as_bytes()` — borrows the existing context; no copy
+    //      and no allocation.
+    //   2. `send_message_impl` — a `Header` and two `IoSlice`s built on the
+    //      stack, then `sendmsg(2)`.
+    //   3. the ack is read with `recv(2)` into a stack array.
+    //
+    // `sendmsg` and `recv` are both on POSIX's async-signal-safe list. Nothing
+    // allocates, takes a lock, or formats a string — note that `is_ok()`
+    // discards any error *without* rendering it, so no `Display` impl runs
+    // here. `client` is captured by move, so obtaining it costs nothing at
+    // signal time either.
+    //
+    // Two things are deliberately absent and must not be added: writing the
+    // report (that is the monitor's job, in a different process) and reading
+    // breadcrumbs (the ring is behind a `Mutex`, which is not
+    // async-signal-safe — see the module docs on why native-crash reports
+    // carry no trail).
     let handler = crash_handler::CrashHandler::attach(unsafe {
         crash_handler::make_crash_event(move |cc: &crash_handler::CrashContext| {
             let handled = client.request_dump(cc).is_ok();

@@ -39,6 +39,44 @@ faultbox::init(
 );
 ```
 
+### Full startup: `tracing` and native-crash capture together
+
+Everything wired up, in the order it has to happen:
+
+```rust
+use tracing_subscriber::prelude::*;
+
+fn main() {
+    // 1. FIRST statement in main. This process may be the crash monitor — a
+    //    re-exec of this same binary — in which case it serves minidumps here
+    //    and never returns. Mandatory whenever the handler is armed below.
+    if faultbox::run_crash_monitor_if_env() {
+        return;
+    }
+
+    // 2. Initialize the recorder. Only the binary does this, and only once.
+    faultbox::init(
+        faultbox::Config::new("myapp", env!("CARGO_PKG_VERSION"), "/var/lib/myapp/reports")
+            .redactor(Box::new(faultbox::BasicRedactor::new()))
+            .features(["encryption", "compression"])
+            // Spawns the out-of-process monitor. Safe because of step 1.
+            .install_native_crash_handler(true),
+    );
+
+    // 3. Install the tracing layer, so events the app already emits become the
+    //    flight recorder.
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(faultbox::BreadcrumbLayer::new().only_targets(["myapp"]))
+        .init();
+
+    run_app();
+}
+# fn run_app() {}
+```
+
+Steps 2 and 3 can be swapped — `BreadcrumbLayer` feeds a ring that is inert until `init` runs, and `init` does not depend on `tracing`. Step 1 cannot move: it must precede all other work, including argument parsing.
+
 ### Get a breadcrumb trail for free
 
 If the project already uses `tracing`, the `tracing` feature turns existing instrumentation into the flight recorder — no manual breadcrumb calls:
@@ -70,6 +108,8 @@ let _ = Capture::new(EventKind::Corruption, "internal node references a non-btre
 ```
 
 `DomainContext` is the per-project extension point. Its `grouping_key` should identify the _class_ of failure, never the instance — `"child_kind=0x09"`, not the page id that happened to be involved — so the same bug groups together across machines.
+
+`emit` is synchronous and does real filesystem work (digest, copy, fsync, a lock). That is deliberate — it must be callable from a panic hook, where an async runtime may no longer be usable. In an async application, call it from `spawn_blocking` (or equivalent) so a failure report cannot stall an executor thread.
 
 ### Read reports back
 
