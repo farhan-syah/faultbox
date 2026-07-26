@@ -25,6 +25,23 @@ Panic-only crash reporters miss the failures that matter most in a storage engin
 
 Each report carries the breadcrumb trail leading up to the failure, a build-id for offline symbolication, project-specific forensic context, and — for corruption — a preserved snapshot of the bad artifact.
 
+## When to use it
+
+The question that decides it is not how long your process lives, it is: **does your software detect failures it cannot reproduce?**
+
+Good fit:
+
+- Storage engines, databases, file-format parsers, sync engines — anything that checks a checksum or an invariant at runtime and can therefore discover that its own data is wrong.
+- Code that crosses into C or C++ through FFI, where a fault arrives as SIGSEGV rather than a panic. `std::panic::set_hook` cannot see those.
+- Long-running services and desktop applications, where a crash otherwise leaves nothing behind.
+
+Poor fit:
+
+- `no_std` and embedded targets. This crate is std-only.
+- Software whose only realistic failure is a panic, already reported somewhere. A panic-only reporter is simpler and does that job.
+
+**Libraries are a good fit, and are expected to be one.** A library should not call `init`, install hooks, or choose the reports directory — that belongs to the binary. But a library that detects its own corruption *should* report it, and everything here stays inert until an application initializes, so depending on it costs a library nothing. See [Using it across a dependency stack](#using-it-across-a-dependency-stack).
+
 ## Usage
 
 ### Initialize once at startup
@@ -225,6 +242,14 @@ Config::new(/* … */).install_native_crash_handler(true)
 Every string entering a report — messages, error chains, breadcrumbs, domain values — passes through a `Redactor`. `BasicRedactor` strips the home directory, masks `key=value` pairs naming a secret, and masks email addresses. It is a sensible default, not a compliance boundary: projects handling regulated data should compose their own on top.
 
 The default is `NoopRedactor`, so set one explicitly before reports leave a machine.
+
+## Platform support
+
+Requires `std`; there is no `no_std` build. Linux, macOS, and Windows run the full test suite in CI.
+
+`wasm32-unknown-unknown` compiles and is **inert**: breadcrumbs are recorded in memory, but there is no filesystem to write a report to and no signals to catch. It is safe to have in the dependency tree of a crate that also targets wasm — linking it will not break the build or panic at runtime — but nothing is captured there. `wasm32-wasip1` is compile-checked too.
+
+`native-crash` and `shared-ring` are host-only. They are off by default, so a wasm or minimal build never pulls in `crash-handler`, `minidumper`, or `memmap2`.
 
 ## Stability
 
