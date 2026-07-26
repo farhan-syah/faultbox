@@ -123,8 +123,17 @@ fn emit(reports_dir: PathBuf, count: usize) {
             key: "class=1".to_owned(),
             value: serde_json::json!({ "i": i }),
         };
-        let _ = faultbox::Capture::new(faultbox::EventKind::Corruption, "contended failure")
+        // Deliberately not ignored. `emit` returns None when the report could
+        // not be written, and swallowing that turns a dropped capture into a
+        // silent shortfall in the occurrence count — which is exactly how a
+        // Windows sharing violation once hid as a mysterious 149-of-150.
+        if faultbox::Capture::new(faultbox::EventKind::Corruption, "contended failure")
             .domain(&ctx)
-            .emit();
+            .emit()
+            .is_none()
+        {
+            eprintln!("crash_helper: emit {i} could not write a report");
+            std::process::exit(4);
+        }
     }
 }

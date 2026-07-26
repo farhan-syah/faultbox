@@ -344,7 +344,7 @@ pub fn commit_artifact(report_dir: &Path, staged: Staged) -> io::Result<Preserve
         } => {
             let dest = report_dir.join(&name);
             remove_any(&dest)?;
-            std::fs::rename(&tmp, &dest)?;
+            rename_over(&tmp, &dest)?;
             sync_dir(report_dir);
             Ok(Preserved::Copied {
                 rel: name,
@@ -599,6 +599,40 @@ impl Drop for DirLock {
     }
 }
 
+/// Rename `from` onto `to`, retrying briefly while the destination is locked by
+/// a concurrent *reader*.
+///
+/// On Windows, renaming onto an existing file fails with `ACCESS_DENIED` for as
+/// long as any other process holds that file open — even read-only. POSIX has
+/// no such rule, which is why this is a Windows-shaped problem.
+///
+/// It is a real one, not a test artifact: report directories are deliberately
+/// readable without the group lock. Retention sweeps read every group's
+/// `report.json` to size it, and any triage tool does the same. So a reader
+/// colliding with a writer is the normal case, and without this retry the
+/// write fails, the capture is dropped, and an occurrence disappears from the
+/// count with nothing logged. Readers hold the file for microseconds, so a
+/// short bounded retry closes the window.
+fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    let mut err = match std::fs::rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    for _ in 0..100 {
+        // Only a sharing violation is worth retrying; anything else is a real
+        // failure and retrying would just delay it.
+        if err.kind() != io::ErrorKind::PermissionDenied {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => err = e,
+        }
+    }
+    Err(err)
+}
+
 /// Write `bytes` to `path` atomically *and* durably: to a temp sibling, fsync,
 /// rename, then fsync the containing directory so the rename itself is durable.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -608,7 +642,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
+    rename_over(&tmp, path)?;
     if let Some(parent) = path.parent() {
         sync_dir(parent);
     }
