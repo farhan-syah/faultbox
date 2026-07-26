@@ -137,16 +137,34 @@ pub fn group_dir(reports_dir: &Path, fingerprint: &str) -> PathBuf {
     reports_dir.join(fingerprint)
 }
 
-/// Create (or open) the report directory for `fingerprint` and take its lock.
+/// Create the report directory for `fingerprint`, without locking it.
 ///
-/// Returns the directory and a held [`DirLock`]; the caller must keep the lock
-/// alive for the whole read-modify-write of the group so two processes hitting
-/// the same bug at once cannot interleave counter updates.
-pub fn open_group(reports_dir: &Path, fingerprint: &str) -> io::Result<(PathBuf, DirLock)> {
+/// Split from [`lock_group`] so the expensive part of a capture — digesting and
+/// copying a preserved artifact — can happen *outside* the lock. Holding the
+/// lock across a multi-gigabyte copy would routinely exceed [`LOCK_STALE_MS`],
+/// at which point a competing process steals the lock and writes the same
+/// destination concurrently.
+pub fn ensure_group_dir(reports_dir: &Path, fingerprint: &str) -> io::Result<PathBuf> {
     std::fs::create_dir_all(reports_dir)?;
     let dir = group_dir(reports_dir, fingerprint);
     std::fs::create_dir_all(&dir)?;
-    let lock = DirLock::acquire(&dir)?;
+    Ok(dir)
+}
+
+/// Take the group's lock. Hold it only for the short read-modify-write of the
+/// group's metadata, never across bulk IO.
+pub fn lock_group(dir: &Path) -> io::Result<DirLock> {
+    DirLock::acquire(dir)
+}
+
+/// Create (or open) the report directory for `fingerprint` and take its lock.
+///
+/// Convenience for callers doing a short, artifact-free update. Anything that
+/// copies bulk data should use [`ensure_group_dir`] + [`lock_group`] so the copy
+/// happens outside the critical section.
+pub fn open_group(reports_dir: &Path, fingerprint: &str) -> io::Result<(PathBuf, DirLock)> {
+    let dir = ensure_group_dir(reports_dir, fingerprint)?;
+    let lock = lock_group(&dir)?;
     Ok((dir, lock))
 }
 
@@ -222,68 +240,147 @@ pub enum Preserved {
     TooLarge { bytes: u64, limit: u64 },
 }
 
-/// Copy a file or directory into an existing report directory as a named
-/// artifact. This is how a corrupt store is preserved beside its report so an
-/// an offline consistency checker runs against the exact bad state.
+/// An artifact copied to a staging path, awaiting the cheap rename into place.
+#[derive(Debug, Clone)]
+pub enum Staged {
+    /// Bytes were copied to `tmp` and are ready to be moved to `name`.
+    Ready {
+        name: String,
+        tmp: PathBuf,
+        bytes: u64,
+        digest: String,
+    },
+    /// An identical copy was already present, so nothing was copied.
+    Reused {
+        name: String,
+        bytes: u64,
+        digest: String,
+    },
+    /// The source exceeded the size cap and was left in place.
+    TooLarge { bytes: u64, limit: u64 },
+}
+
+/// Digest a source artifact and copy it to a staging path beside its final
+/// destination — the slow half of preserving, deliberately done **without the
+/// group lock held**.
 ///
-/// The source is digested before it is copied. If an artifact of the same name
-/// is already present from an earlier occurrence *and its digest matches*, the
-/// copy is skipped ([`Preserved::Reused`]) — this is what stops a crash loop
-/// from writing the same multi-gigabyte snapshot over and over. A *differing*
-/// digest is never silently aliased: the new bytes replace the old, because a
-/// report claiming to hold the state it saw must actually hold it.
+/// Holding the lock across a multi-gigabyte copy would routinely exceed
+/// [`LOCK_STALE_MS`], at which point a competing process assumes the holder
+/// died, steals the lock, and writes the same destination concurrently.
+/// Staging is per-process, so two processes preserving at once can never
+/// interleave their bytes into one artifact.
+///
+/// If an artifact of the same name is already present from an earlier
+/// occurrence *and its digest matches*, nothing is copied ([`Staged::Reused`]) —
+/// this is what stops a crash loop from writing the same snapshot over and
+/// over. A *differing* digest is never silently aliased: the new bytes replace
+/// the old, because a report claiming to hold the state it saw must hold it.
 ///
 /// `max_bytes` caps the copy so preserving a store cannot fill the disk of the
 /// very daemon whose durability is in question.
-pub fn preserve_artifact(
+pub fn stage_artifact(
     report_dir: &Path,
     src: &Path,
     name: &str,
     max_bytes: u64,
-) -> io::Result<Preserved> {
+) -> io::Result<Staged> {
     let (bytes, digest) = digest_of(src)?;
     if bytes > max_bytes {
-        return Ok(Preserved::TooLarge {
+        return Ok(Staged::TooLarge {
             bytes,
             limit: max_bytes,
         });
     }
 
     let dest = report_dir.join(name);
-    if dest.exists() {
-        // An earlier occurrence already preserved something under this name.
-        // Reuse it only if it is provably the same bytes.
-        if let Ok((existing_bytes, existing_digest)) = digest_of(&dest)
-            && existing_digest == digest
-        {
-            return Ok(Preserved::Reused {
-                rel: name.to_owned(),
-                bytes: existing_bytes,
-                digest,
-            });
-        }
-        // Different state under the same name: replace it.
-        if dest.is_dir() {
-            std::fs::remove_dir_all(&dest)?;
-        } else {
-            std::fs::remove_file(&dest)?;
-        }
+    if dest.exists()
+        && let Ok((existing_bytes, existing_digest)) = digest_of(&dest)
+        && existing_digest == digest
+    {
+        return Ok(Staged::Reused {
+            name: name.to_owned(),
+            bytes: existing_bytes,
+            digest,
+        });
     }
 
+    let tmp = report_dir.join(format!("{name}.incoming.{}", std::process::id()));
+    remove_any(&tmp)?;
     if src.is_dir() {
-        copy_dir_recursive(src, &dest)?;
+        copy_dir_recursive(src, &tmp)?;
     } else {
-        if let Some(parent) = dest.parent() {
+        if let Some(parent) = tmp.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(src, &dest)?;
+        std::fs::copy(src, &tmp)?;
     }
-    sync_dir(report_dir);
-    Ok(Preserved::Copied {
-        rel: name.to_owned(),
+    Ok(Staged::Ready {
+        name: name.to_owned(),
+        tmp,
         bytes,
         digest,
     })
+}
+
+/// Move a [`Staged`] artifact into its final name — the fast half, safe to run
+/// while holding the group lock.
+pub fn commit_artifact(report_dir: &Path, staged: Staged) -> io::Result<Preserved> {
+    match staged {
+        Staged::Reused {
+            name,
+            bytes,
+            digest,
+        } => Ok(Preserved::Reused {
+            rel: name,
+            bytes,
+            digest,
+        }),
+        Staged::TooLarge { bytes, limit } => Ok(Preserved::TooLarge { bytes, limit }),
+        Staged::Ready {
+            name,
+            tmp,
+            bytes,
+            digest,
+        } => {
+            let dest = report_dir.join(&name);
+            remove_any(&dest)?;
+            std::fs::rename(&tmp, &dest)?;
+            sync_dir(report_dir);
+            Ok(Preserved::Copied {
+                rel: name,
+                bytes,
+                digest,
+            })
+        }
+    }
+}
+
+/// Remove a path whether it is a file or a directory; absent is success.
+fn remove_any(path: &Path) -> io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Preserve an artifact in one step: stage, then commit.
+///
+/// Convenience for callers that hold no lock. `Capture::emit` calls the two
+/// halves separately so the copy stays outside the group's critical section.
+pub fn preserve_artifact(
+    report_dir: &Path,
+    src: &Path,
+    name: &str,
+    max_bytes: u64,
+) -> io::Result<Preserved> {
+    let staged = stage_artifact(report_dir, src, name, max_bytes)?;
+    commit_artifact(report_dir, staged)
 }
 
 /// Total size and content digest of a file or directory tree.
@@ -391,14 +488,15 @@ pub fn prune(reports_dir: &Path, retention: Retention, keep: &Path) {
         if !dir.is_dir() || dir == keep {
             continue;
         }
-        let last_seen = load_report(&dir).map(|r| r.last_seen_ms).unwrap_or(0);
-        let size = dir_size(&dir);
+        let (last_seen, size) = load_report(&dir)
+            .map(|r| (r.last_seen_ms, reported_size(&r)))
+            .unwrap_or((0, 0));
         groups.push((last_seen, size, dir));
     }
     groups.sort_by_key(|(ts, _, _)| *ts);
 
     // `keep` counts against both budgets even though it is never removed.
-    let kept_size = dir_size(keep);
+    let kept_size = load_report(keep).map(|r| reported_size(&r)).unwrap_or(0);
     let mut count = groups.len() + 1;
     let mut total: u64 = kept_size + groups.iter().map(|(_, s, _)| *s).sum::<u64>();
 
@@ -413,20 +511,21 @@ pub fn prune(reports_dir: &Path, retention: Retention, keep: &Path) {
     }
 }
 
-fn dir_size(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut total = 0;
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            total += dir_size(&entry.path());
-        } else if ft.is_file() {
-            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-        }
-    }
-    total
+/// A group's size, taken from the sizes already recorded on its report rather
+/// than by walking the tree.
+///
+/// `prune` runs after every capture, and a recursive `stat` of every file in
+/// every retained group would put an unbounded directory walk on the hot path
+/// of a crash loop — the precise situation where the recorder must stay cheap.
+/// Artifacts dominate a group's size and their byte counts are already known,
+/// so this is exact where it matters; the JSON files it ignores are kilobytes
+/// against a retention budget measured in gigabytes.
+fn reported_size(report: &Report) -> u64 {
+    report
+        .artifacts
+        .iter()
+        .filter_map(|a| a.bytes)
+        .fold(0u64, u64::saturating_add)
 }
 
 /// A cross-process advisory lock over one report group, held for the duration
@@ -741,6 +840,87 @@ mod tests {
         assert!(keep.is_dir(), "the just-written group is never pruned");
         assert!(!reports.join("bbbb").is_dir(), "oldest prunable group goes");
         assert!(reports.join("cccc").is_dir(), "newest group survives");
+    }
+
+    #[test]
+    fn staging_leaves_no_incoming_path_behind_and_lands_the_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("main.db"), b"pages").unwrap();
+        let report_dir = tmp.path().join("report");
+        std::fs::create_dir_all(&report_dir).unwrap();
+
+        // The slow half copies to a per-process staging path...
+        let staged = stage_artifact(&report_dir, &store, "snap", u64::MAX).unwrap();
+        let Staged::Ready {
+            tmp: ref staging, ..
+        } = staged
+        else {
+            panic!("expected a staged copy, got {staged:?}");
+        };
+        assert!(staging.is_dir(), "bytes land in staging first");
+        assert!(
+            !report_dir.join("snap").exists(),
+            "the final name must not appear until commit"
+        );
+
+        // ...and the fast half renames it into place under the lock.
+        let out = commit_artifact(&report_dir, staged).unwrap();
+        assert!(matches!(out, Preserved::Copied { .. }));
+        assert_eq!(
+            std::fs::read(report_dir.join("snap/main.db")).unwrap(),
+            b"pages"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&report_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".incoming."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging paths must not leak: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn prune_enforces_the_byte_budget_from_recorded_artifact_sizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path();
+
+        // Three groups, each claiming a 1 KiB artifact, oldest first.
+        for (fp, last_seen) in [("aaaa", 100u128), ("bbbb", 200), ("cccc", 300)] {
+            let dir = reports.join(fp);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut r = sample_report();
+            r.fingerprint = fp.to_owned();
+            r.last_seen_ms = last_seen;
+            r.artifacts = vec![crate::report::Artifact {
+                kind: "store".to_owned(),
+                rel_path: "snap".to_owned(),
+                note: None,
+                digest: Some("0".to_owned()),
+                bytes: Some(1024),
+            }];
+            write_report_json(&dir, &r).unwrap();
+        }
+        let keep = reports.join("cccc");
+
+        // Budget for two groups' worth of bytes; the oldest must go.
+        prune(
+            reports,
+            Retention {
+                max_groups: usize::MAX,
+                max_total_bytes: 2048,
+            },
+            &keep,
+        );
+
+        assert!(!reports.join("aaaa").is_dir(), "oldest evicted for bytes");
+        assert!(reports.join("bbbb").is_dir());
+        assert!(keep.is_dir(), "the current group is never pruned");
     }
 
     #[test]

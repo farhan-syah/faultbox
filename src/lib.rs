@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `blackbox` — a production black-box recorder.
+//! `faultbox` — a production black-box recorder.
 //!
 //! One report format for every failure class — Rust panics, native crashes,
 //! detected data corruption, and invariant violations — each carrying a
@@ -51,7 +51,7 @@ pub use tracing_layer::BreadcrumbLayer;
 pub use writer::Retention;
 
 /// Re-exported so adopters can build [`DomainContext::to_json`] payloads
-/// (`blackbox::serde_json::json!{…}`) without taking their own dependency.
+/// (`faultbox::serde_json::json!{…}`) without taking their own dependency.
 pub use serde_json;
 
 /// Process-wide configuration, set once via [`init`].
@@ -89,7 +89,7 @@ pub struct Config {
     /// When set, crumbs are recorded to both the in-process recorder and this
     /// ring, and reports carry the two trails merged by timestamp — so a
     /// corruption detected here can show the writes that caused it *in another
-    /// process*. Open one per store, e.g. at `<store>/.blackbox-ring`.
+    /// process*. Open one per store, e.g. at `<store>/.faultbox-ring`.
     #[cfg(feature = "shared-ring")]
     pub shared_ring: Option<std::sync::Arc<shared_ring::SharedRing>>,
     /// Whether [`init`] installs the panic hook.
@@ -241,7 +241,7 @@ pub fn init(config: Config) -> bool {
 ///
 /// ```no_run
 /// fn main() {
-///     if blackbox::run_crash_monitor_if_env() {
+///     if faultbox::run_crash_monitor_if_env() {
 ///         return;
 ///     }
 ///     // ...normal startup
@@ -438,18 +438,37 @@ impl Capture {
             last_seen_ms: now,
         };
 
-        // Hold the group lock across the whole read-modify-write: a supervisor
-        // restarting a crashing daemon has several processes racing on exactly
-        // this directory.
-        let (dir, _lock) = writer::open_group(&cfg.reports_dir, &report.fingerprint).ok()?;
+        let dir = writer::ensure_group_dir(&cfg.reports_dir, &report.fingerprint).ok()?;
 
-        for pending in &self.artifacts {
-            report
-                .artifacts
-                .push(preserve_pending(&dir, pending, cfg.preserve_max_bytes));
+        // Digest and copy artifacts BEFORE taking the lock. Preserving a store
+        // can move gigabytes; doing it under the lock would routinely outlast
+        // the staleness window, and a competing process would steal the lock
+        // and copy over us mid-write.
+        let staged: Vec<_> = self
+            .artifacts
+            .iter()
+            .map(|pending| {
+                (
+                    pending,
+                    writer::stage_artifact(
+                        &dir,
+                        &pending.src,
+                        &pending.name,
+                        cfg.preserve_max_bytes,
+                    ),
+                )
+            })
+            .collect();
+
+        // Everything from here is fast, so the lock is held only briefly. A
+        // supervisor restarting a crashing daemon has several processes racing
+        // on exactly this directory.
+        let _lock = writer::lock_group(&dir).ok()?;
+        for (pending, staged) in staged {
+            report.artifacts.push(commit_pending(&dir, pending, staged));
         }
-
         writer::commit_into(&dir, &mut report).ok()?;
+        drop(_lock);
         writer::prune(&cfg.reports_dir, cfg.retention, &dir);
         Some(dir)
     }
@@ -459,14 +478,18 @@ impl Capture {
 /// refusal — into an [`Artifact`] entry. An artifact that could not be captured
 /// is recorded as such, because an analyst reading the report needs to know the
 /// snapshot is missing rather than infer it from an absent field.
-fn preserve_pending(dir: &std::path::Path, pending: &PendingArtifact, max_bytes: u64) -> Artifact {
+fn commit_pending(
+    dir: &std::path::Path,
+    pending: &PendingArtifact,
+    staged: std::io::Result<writer::Staged>,
+) -> Artifact {
     let note_with = |extra: &str| {
         Some(match &pending.note {
             Some(n) => format!("{n} ({extra})"),
             None => extra.to_owned(),
         })
     };
-    match writer::preserve_artifact(dir, &pending.src, &pending.name, max_bytes) {
+    match staged.and_then(|s| writer::commit_artifact(dir, s)) {
         Ok(writer::Preserved::Copied { rel, bytes, digest }) => Artifact {
             kind: pending.kind.clone(),
             rel_path: rel,
@@ -596,7 +619,7 @@ mod tests {
     /// Cargo features happen to be enabled.
     #[test]
     fn native_crash_handler_is_never_armed_by_default() {
-        let cfg = Config::new("t", "0.1.0", "/tmp/blackbox-test-reports");
+        let cfg = Config::new("t", "0.1.0", "/tmp/faultbox-test-reports");
         assert!(
             !cfg.install_native_crash_handler,
             "enabling the `native-crash` feature must not arm the handler; \

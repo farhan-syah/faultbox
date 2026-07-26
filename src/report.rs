@@ -5,7 +5,7 @@
 //! A [`Report`] is the single artifact every failure class serializes to —
 //! panics, native crashes, detected corruption, and invariant violations all
 //! produce the same shape so downstream tooling (bug reports, symbolication,
-//! grouping) is uniform across every project that adopts `blackbox`.
+//! grouping) is uniform across every project that adopts `faultbox`.
 //!
 //! Pre-1.0, the shape defined here is the *only* supported shape. Reports are
 //! short-lived diagnostic artifacts, not durable user data, so the schema is
@@ -38,7 +38,7 @@ pub enum EventKind {
     /// A Rust panic (caught by the installed panic hook).
     Panic,
     /// A native/hardware crash (SIGSEGV, abort, stack overflow) captured
-    /// out-of-process as a minidump. `blackbox` records the metadata; the
+    /// out-of-process as a minidump. `faultbox` records the metadata; the
     /// minidump itself is an [`Artifact`].
     NativeCrash,
     /// Detected data corruption (checksum/AEAD failure, structural violation).
@@ -92,19 +92,23 @@ pub struct Meta {
 }
 
 impl Meta {
-    /// Best-effort parent pid. `None` where the platform has no cheap answer.
+    /// Best-effort parent pid.
+    ///
+    /// Read from procfs, so it is `None` anywhere procfs is absent — macOS and
+    /// the BSDs included, despite those being `unix`. Getting it there means
+    /// `getppid(2)`, and a libc dependency is not worth one advisory field on a
+    /// report; callers already treat this as optional.
     #[must_use]
     pub fn current_ppid() -> Option<u32> {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            // `getppid` is always successful and has no libc dependency here:
-            // read it from procfs where available, else fall back to `None`.
-            let stat = std::fs::read_to_string("/proc/self/status").ok()?;
-            stat.lines()
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            status
+                .lines()
                 .find_map(|l| l.strip_prefix("PPid:"))
                 .and_then(|v| v.trim().parse().ok())
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             None
         }

@@ -60,11 +60,12 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   test:
-    name: Test (${{ matrix.features-label }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, ${{ matrix.features-label }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         include:
           - features-label: default
             features: ""
@@ -81,8 +82,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+      # Includes tests/multiprocess.rs, which spawns the crash_helper binary to
+      # exercise the crash monitor, the cross-process group lock, and the shared
+      # ring — none of which a single-process test can reach.
       - run: cargo nextest run ${{ matrix.features }}
-      # nextest does not run doctests; the README examples are load-bearing
+      # nextest does not run doctests; the examples are load-bearing
       # documentation for a crate whose misuse fork-bombs the host.
       - run: cargo test --doc ${{ matrix.features }}
 

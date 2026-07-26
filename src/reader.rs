@@ -9,7 +9,7 @@
 //! layout or hand-rolling JSON parsing.
 //!
 //! ```no_run
-//! for group in blackbox::reader::list("/var/lib/myapp/reports")? {
+//! for group in faultbox::reader::list("/var/lib/myapp/reports")? {
 //!     println!("{}", group.summary());
 //! }
 //! # Ok::<(), std::io::Error>(())

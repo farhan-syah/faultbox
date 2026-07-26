@@ -1,18 +1,21 @@
 [package]
-name = "blackbox"
+name = "faultbox"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Production black-box recorder: structured crash, corruption, and invariant-violation reports with a flight-recorder breadcrumb trail — debuggable from a report without reproduction or shipped symbols."
-repository = "https://github.com/nodedb-lab/blackbox"
-homepage = "https://github.com/nodedb-lab/blackbox"
-documentation = "https://docs.rs/blackbox"
+repository = "https://github.com/farhansyah/faultbox"
+homepage = "https://github.com/farhansyah/faultbox"
+documentation = "https://docs.rs/faultbox"
 readme = "README.md"
 keywords = ["crash", "diagnostics", "corruption", "reporting", "observability"]
 categories = ["development-tools::debugging"]
 authors = ["Farhan Syah"]
 resolver = "3"
+# The multi-process test helper binary and the tests that drive it are build-time
+# only. Excluding them keeps the published crate a pure library.
+exclude = ["src/bin", "tests/multiprocess.rs", ".claude"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -22,7 +25,7 @@ all-features = true
 [features]
 # Out-of-process native-crash (SIGSEGV/abort/stack-overflow) capture as a
 # minidump. Pulls in the Embark crash toolchain and requires the host to call
-# `blackbox::run_crash_monitor_if_env()` at the very top of `main`. Off by
+# `faultbox::run_crash_monitor_if_env()` at the very top of `main`. Off by
 # default so the base recorder (panics, corruption, invariants) stays lean.
 native-crash = ["dep:crash-handler", "dep:minidumper"]
 

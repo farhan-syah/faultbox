@@ -35,12 +35,12 @@ use crate::writer;
 
 /// Presence of this env var marks a process as the crash monitor and carries
 /// the IPC socket name. Set by [`install`] on the spawned child.
-pub const ENV_SOCKET: &str = "BLACKBOX_CRASH_SOCKET";
-const ENV_REPORTS_DIR: &str = "BLACKBOX_CRASH_REPORTS_DIR";
-const ENV_PROJECT: &str = "BLACKBOX_CRASH_PROJECT";
-const ENV_VERSION: &str = "BLACKBOX_CRASH_VERSION";
-const ENV_GIT_SHA: &str = "BLACKBOX_CRASH_GIT_SHA";
-const ENV_BUILD_ID: &str = "BLACKBOX_CRASH_BUILD_ID";
+pub const ENV_SOCKET: &str = "FAULTBOX_CRASH_SOCKET";
+const ENV_REPORTS_DIR: &str = "FAULTBOX_CRASH_REPORTS_DIR";
+const ENV_PROJECT: &str = "FAULTBOX_CRASH_PROJECT";
+const ENV_VERSION: &str = "FAULTBOX_CRASH_VERSION";
+const ENV_GIT_SHA: &str = "FAULTBOX_CRASH_GIT_SHA";
+const ENV_BUILD_ID: &str = "FAULTBOX_CRASH_BUILD_ID";
 
 /// Keeps the crash handler and IPC client alive for the process's lifetime.
 /// Dropping either would uninstall the hooks, so they are parked here.
@@ -99,12 +99,12 @@ pub fn install(cfg: &crate::Config) {
     // exactly the corruption it exists to report on.
     if std::env::var_os(ENV_SOCKET).is_some() {
         eprintln!(
-            "blackbox: FATAL — this process was spawned as the crash monitor, but \
-             `blackbox::run_crash_monitor_if_env()` was never called, so it resumed \
+            "faultbox: FATAL — this process was spawned as the crash monitor, but \
+             `faultbox::run_crash_monitor_if_env()` was never called, so it resumed \
              normal startup as a duplicate instance of the application.\n\
-             blackbox: add this as the first statement in `main`:\n\
-             blackbox:     if blackbox::run_crash_monitor_if_env() {{ return; }}\n\
-             blackbox: exiting to avoid spawning further copies."
+             faultbox: add this as the first statement in `main`:\n\
+             faultbox:     if faultbox::run_crash_monitor_if_env() {{ return; }}\n\
+             faultbox: exiting to avoid spawning further copies."
         );
         std::process::exit(70);
     }
@@ -113,7 +113,7 @@ pub fn install(cfg: &crate::Config) {
             let _ = GUARD.set(guard);
         }
         Err(e) => {
-            eprintln!("blackbox: native-crash capture not installed: {e}");
+            eprintln!("faultbox: native-crash capture not installed: {e}");
         }
     }
 }
@@ -124,7 +124,7 @@ fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
     // Unique per (pid, start) so concurrent processes don't collide. No RNG
     // dependency: pid + capture time is sufficiently unique for a socket name.
     let socket = format!(
-        "blackbox-{}-{}-{}",
+        "faultbox-{}-{}-{}",
         cfg.project,
         std::process::id(),
         crate::now_ms()
@@ -173,7 +173,7 @@ fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
             let _ = child.wait();
             return Err(format!(
                 "{e} — the monitor process was killed. Ensure `main` calls \
-                 `blackbox::run_crash_monitor_if_env()` before any other work."
+                 `faultbox::run_crash_monitor_if_env()` before any other work."
             ));
         }
     };
@@ -228,7 +228,7 @@ fn run_monitor(socket: &str) -> i32 {
     let mut server = match minidumper::Server::with_name(name) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("blackbox monitor: bind {socket}: {e}");
+            eprintln!("faultbox monitor: bind {socket}: {e}");
             return 1;
         }
     };
@@ -237,7 +237,7 @@ fn run_monitor(socket: &str) -> i32 {
     match server.run(Box::new(handler), &shutdown, None) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("blackbox monitor: server run: {e}");
+            eprintln!("faultbox monitor: server run: {e}");
             1
         }
     }
@@ -258,7 +258,7 @@ impl MonitorHandler {
         let opt = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
         MonitorHandler {
             reports_dir: opt(ENV_REPORTS_DIR)
-                .map_or_else(|| PathBuf::from("blackbox-crash-reports"), PathBuf::from),
+                .map_or_else(|| PathBuf::from("faultbox-crash-reports"), PathBuf::from),
             project: opt(ENV_PROJECT).unwrap_or_else(|| "unknown".to_owned()),
             version: opt(ENV_VERSION).unwrap_or_else(|| "0.0.0".to_owned()),
             git_sha: opt(ENV_GIT_SHA),
@@ -351,7 +351,7 @@ impl minidumper::ServerHandler for MonitorHandler {
                     self.write_report(report_dir);
                 }
             }
-            Err(e) => eprintln!("blackbox monitor: minidump write failed: {e}"),
+            Err(e) => eprintln!("faultbox monitor: minidump write failed: {e}"),
         }
         // One crash per client is all we can capture; keep serving in case
         // another client (there is only one) reconnects — disconnect exits.

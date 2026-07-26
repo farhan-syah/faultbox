@@ -2,7 +2,7 @@
 
 //! Panic → report bridge.
 //!
-//! [`install_hook`] chains a `blackbox` capture in front of the previous panic
+//! [`install_hook`] chains a `faultbox` capture in front of the previous panic
 //! hook: every panic writes a [`crate::report::EventKind::Panic`] report (with
 //! the current breadcrumb trail and a backtrace) and then the original hook
 //! still runs, so existing behaviour (abort, default message) is preserved.

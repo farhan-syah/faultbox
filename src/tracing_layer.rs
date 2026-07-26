@@ -18,12 +18,12 @@
 //! ```no_run
 //! use tracing_subscriber::prelude::*;
 //!
-//! blackbox::init(blackbox::Config::new("myapp", "0.1.0", "/var/lib/myapp/reports"));
+//! faultbox::init(faultbox::Config::new("myapp", "0.1.0", "/var/lib/myapp/reports"));
 //!
 //! tracing_subscriber::registry()
 //!     // ...alongside whatever layers the project already installs
 //!     // (`tracing_subscriber::fmt::layer()`, an EnvFilter, an exporter).
-//!     .with(blackbox::BreadcrumbLayer::new().only_targets(["myapp"]))
+//!     .with(faultbox::BreadcrumbLayer::new().only_targets(["myapp"]))
 //!     .init();
 //! ```
 //!

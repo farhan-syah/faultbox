@@ -133,8 +133,8 @@ pub fn snapshot() -> Vec<Breadcrumb> {
 /// Emit a breadcrumb ergonomically.
 ///
 /// ```ignore
-/// blackbox::breadcrumb!(Info, "myapp.commit", "committed", { "commit_id": 9557 });
-/// blackbox::breadcrumb!(Warn, "myapp.free", "freed chain");
+/// faultbox::breadcrumb!(Info, "myapp.commit", "committed", { "commit_id": 9557 });
+/// faultbox::breadcrumb!(Warn, "myapp.free", "freed chain");
 /// ```
 #[macro_export]
 macro_rules! breadcrumb {

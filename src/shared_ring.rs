@@ -49,9 +49,9 @@ use memmap2::MmapMut;
 
 use crate::breadcrumbs::{Breadcrumb, Level};
 
-/// `"BBXRING1"` — identifies the file and its layout. A file that does not
+/// `"FBXRING1"` — identifies the file and its layout. A file that does not
 /// start with this is reinitialized rather than parsed.
-const MAGIC: u64 = u64::from_le_bytes(*b"BBXRING1");
+const MAGIC: u64 = u64::from_le_bytes(*b"FBXRING1");
 
 /// Bytes per slot. Fixed so a writer never allocates and a reader never has to
 /// trust a length to find the next record. 256 leaves ~230 bytes of text, which
@@ -93,15 +93,25 @@ unsafe impl Send for SharedRing {}
 unsafe impl Sync for SharedRing {}
 
 impl SharedRing {
-    /// Open (creating if absent) the shared ring at `path` with room for
-    /// `capacity` breadcrumbs.
+    /// Open (creating if absent) the shared ring at `path`, with room for
+    /// `capacity` breadcrumbs *if this call is the one that creates it*.
     ///
-    /// An existing file with a matching magic and capacity is *joined*, keeping
-    /// the crumbs already in it — that is the whole point: the trail outlives
-    /// any single process. A file with the wrong magic or size is reinitialized.
+    /// An existing, well-formed ring is **joined as-is**: its crumbs are kept
+    /// and its own capacity is adopted, even when it differs from `capacity`.
+    /// Use [`capacity`](Self::capacity) to see what was actually joined.
+    ///
+    /// Adopting rather than resizing is a safety requirement, not a
+    /// convenience. The file is mapped into every participating process; a
+    /// second opener that shrank it to its own preferred size would leave every
+    /// existing mapping pointing past end-of-file, and the next breadcrumb
+    /// those processes recorded would take SIGBUS. A recorder must not be able
+    /// to kill the healthy processes it is monitoring because two of them
+    /// disagreed about a capacity.
+    ///
+    /// A file that is absent, empty, or not a recognizable ring is (re)created
+    /// at the requested capacity.
     pub fn open(path: impl AsRef<Path>, capacity: usize) -> io::Result<SharedRing> {
         let capacity = capacity.max(1);
-        let len = HEADER + capacity * SLOT;
 
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
@@ -113,34 +123,59 @@ impl SharedRing {
             .truncate(false)
             .open(path)?;
 
+        // Join an existing ring if the file already describes one coherently.
         let existing = file.metadata()?.len();
-        if existing != len as u64 {
-            file.set_len(len as u64)?;
+        if existing >= HEADER as u64 {
+            // SAFETY: the file is at least HEADER bytes and stays mapped for the
+            // lifetime of the value; concurrent mutation by other processes is
+            // the intended design and every access is atomic or bounds-checked.
+            let map = unsafe { MmapMut::map_mut(&file)? };
+            let ring = SharedRing { map, capacity: 1 };
+            let magic = ring.header(HDR_MAGIC).load(Ordering::Acquire);
+            let found = ring.header(HDR_CAPACITY).load(Ordering::Acquire);
+            // The header must agree with the file's actual size, or it is not a
+            // ring we can safely address.
+            let coherent = magic == MAGIC
+                && found > 0
+                && usize::try_from(found)
+                    .ok()
+                    .and_then(|c| c.checked_mul(SLOT))
+                    .and_then(|b| b.checked_add(HEADER))
+                    .is_some_and(|want| want as u64 == existing);
+            if coherent {
+                return Ok(SharedRing {
+                    capacity: found,
+                    ..ring
+                });
+            }
         }
 
-        // SAFETY: the file is sized above and stays mapped for the lifetime of
-        // the returned value. Other processes mutating it concurrently is the
-        // intended design, and every access below is atomic or bounds-checked.
+        // Not a usable ring: create it at the requested capacity.
+        let len = HEADER + capacity * SLOT;
+        file.set_len(len as u64)?;
+        // SAFETY: as above; the file was just sized to `len`.
         let map = unsafe { MmapMut::map_mut(&file)? };
         let ring = SharedRing {
             map,
             capacity: capacity as u64,
         };
-
-        // Initialize only when the file is new or does not describe the ring we
-        // asked for. Joining an existing, matching ring must not clear it.
-        let magic_ok = ring.header(HDR_MAGIC).load(Ordering::Acquire) == MAGIC;
-        let cap_ok = ring.header(HDR_CAPACITY).load(Ordering::Acquire) == capacity as u64;
-        if !magic_ok || !cap_ok || existing != len as u64 {
-            ring.header(HDR_TICKET).store(0, Ordering::Release);
-            for slot in 0..capacity {
-                ring.slot_seq(slot as u64).store(0, Ordering::Release);
-            }
-            ring.header(HDR_CAPACITY)
-                .store(capacity as u64, Ordering::Release);
-            ring.header(HDR_MAGIC).store(MAGIC, Ordering::Release);
+        ring.header(HDR_TICKET).store(0, Ordering::Release);
+        for slot in 0..capacity {
+            ring.slot_seq(slot as u64).store(0, Ordering::Release);
         }
+        ring.header(HDR_CAPACITY)
+            .store(capacity as u64, Ordering::Release);
+        // Magic last: until it is set, a concurrent opener treats the file as
+        // not-yet-a-ring rather than reading a half-built one.
+        ring.header(HDR_MAGIC).store(MAGIC, Ordering::Release);
         Ok(ring)
+    }
+
+    /// The capacity actually in use — the creator's, which may differ from the
+    /// value this process passed to [`open`](Self::open).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity as usize
     }
 
     /// Append a breadcrumb. Never blocks, never allocates, and silently
@@ -356,6 +391,35 @@ mod tests {
             ["good", "after"],
             "the abandoned slot costs one crumb and nothing else"
         );
+    }
+
+    /// Regression: a second opener requesting a different capacity must not
+    /// resize the file. Shrinking it would leave the first process's mapping
+    /// pointing past EOF, and its next `record` would take SIGBUS — the
+    /// recorder killing the process it was monitoring.
+    #[test]
+    fn joining_with_a_different_capacity_adopts_rather_than_resizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ring");
+
+        let first = SharedRing::open(&path, 64).unwrap();
+        first.record(Level::Info, "t", "before");
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        // A second participant that disagrees about capacity.
+        let second = SharedRing::open(&path, 4).unwrap();
+        assert_eq!(second.capacity(), 64, "the creator's capacity is adopted");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size_before,
+            "the file must not be resized under a live mapping"
+        );
+
+        // Both mappings remain usable, and the existing trail is intact.
+        second.record(Level::Info, "t", "after");
+        first.record(Level::Info, "t", "still alive");
+        let messages: Vec<String> = first.snapshot().into_iter().map(|c| c.message).collect();
+        assert_eq!(messages, ["before", "after", "still alive"]);
     }
 
     #[test]

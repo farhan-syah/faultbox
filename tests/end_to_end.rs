@@ -5,7 +5,7 @@
 //! context and a preserved snapshot of the bad store — and verify the on-disk
 //! report is complete and reloadable.
 
-use blackbox::{Capture, Config, DomainContext, EventKind, Report};
+use faultbox::{Capture, Config, DomainContext, EventKind, Report};
 
 /// The forensic context a storage engine would attach at a dangling-child
 /// detection site.
@@ -39,16 +39,16 @@ fn corruption_report_is_captured_with_context_breadcrumbs_and_artifact() {
     let reports_dir = tmp.path().join("crash-reports");
 
     // Init once (no panic hook in tests).
-    assert!(blackbox::init(
+    assert!(faultbox::init(
         Config::new("myapp", "0.1.0", &reports_dir)
             .git_sha("deadbeefcafe")
             .install_panic_hook(false),
     ));
 
     // Operation trail leading up to the failure — the flight recorder.
-    blackbox::breadcrumb!(Info, "myapp.reopen", "opened store", { "commit_id": 9557 });
-    blackbox::breadcrumb!(Debug, "myapp.free", "released overflow chain", { "root": 6050 });
-    blackbox::breadcrumb!(Info, "myapp.commit", "committed", { "commit_id": 9558 });
+    faultbox::breadcrumb!(Info, "myapp.reopen", "opened store", { "commit_id": 9557 });
+    faultbox::breadcrumb!(Debug, "myapp.free", "released overflow chain", { "root": 6050 });
+    faultbox::breadcrumb!(Info, "myapp.commit", "committed", { "commit_id": 9558 });
 
     // A fake corrupt store to preserve for offline fsck.
     let store = tmp.path().join("db");
@@ -103,7 +103,7 @@ fn corruption_report_is_captured_with_context_breadcrumbs_and_artifact() {
     // Fingerprint is stable and groups by (site, failure class), independent of
     // the specific page ids or message — a different report at the same site
     // with the same child-kind must land in the same group.
-    let fp_other_pages = blackbox::writer::fingerprint(
+    let fp_other_pages = faultbox::writer::fingerprint(
         "myapp",
         EventKind::Corruption,
         "store.dangling_child|child_kind=0x09",

@@ -17,7 +17,7 @@ use serde::Serialize;
 /// Project-specific forensic context attached to a report.
 ///
 /// Implementors return only structural/diagnostic data — never user content
-/// (keys, values, paths that identify user data). The `blackbox` writer applies
+/// (keys, values, paths that identify user data). The `faultbox` writer applies
 /// the configured [`Redactor`] to the serialized value as defence in depth.
 pub trait DomainContext {
     /// Short domain tag, e.g. `"store.dangling_child"`. Becomes part of the

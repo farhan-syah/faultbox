@@ -13,7 +13,7 @@
 //! directory carrying `occurrences: N`, while still preserving exactly one copy
 //! of the artifact.
 
-use blackbox::{Capture, Config, DomainContext, EventKind};
+use faultbox::{Capture, Config, DomainContext, EventKind};
 
 struct DanglingChild {
     child_kind: u8,
@@ -38,7 +38,7 @@ fn a_crash_loop_collapses_into_one_group_with_an_occurrence_count() {
     let tmp = tempfile::tempdir().unwrap();
     let reports_dir = tmp.path().join("crash-reports");
 
-    assert!(blackbox::init(
+    assert!(faultbox::init(
         Config::new("myapp", "0.1.0", &reports_dir).install_panic_hook(false)
     ));
 
@@ -77,7 +77,7 @@ fn a_crash_loop_collapses_into_one_group_with_an_occurrence_count() {
     );
 
     // The directory listing agrees: one group, not 200.
-    let groups = blackbox::reader::list(&reports_dir).unwrap();
+    let groups = faultbox::reader::list(&reports_dir).unwrap();
     assert_eq!(groups.len(), 1);
 
     let group = &groups[0];
@@ -87,7 +87,7 @@ fn a_crash_loop_collapses_into_one_group_with_an_occurrence_count() {
         "the count that matters is preserved, not the directory count"
     );
     assert!(group.first.first_seen_ms <= group.first.last_seen_ms);
-    assert_eq!(blackbox::reader::total_occurrences(&groups), HITS);
+    assert_eq!(faultbox::reader::total_occurrences(&groups), HITS);
 
     // The first capture is kept verbatim; the most recent one is also available.
     assert!(group.first.message.contains("page 6000"));
