@@ -21,11 +21,18 @@
 //!   normal startup. In a normal process the env var is absent and it returns
 //!   `false` immediately.
 //!
-//! Breadcrumbs and [`crate::DomainContext`] live in the crashed process's RAM
-//! and cannot cross to the monitor — the minidump is the forensic payload for
-//! native crashes; offline symbolication against the build-id recovers the
-//! faulting frames. This is an inherent property of out-of-process capture, not
-//! a limitation of the schema.
+//! [`crate::DomainContext`] lives in the crashed process's RAM and cannot cross
+//! to the monitor — the minidump is the forensic payload for native crashes,
+//! and offline symbolication against the build-id recovers the faulting frames.
+//!
+//! Breadcrumbs *can* cross, but only through the shared ring (`shared-ring`
+//! feature). The in-process recorder cannot: it dies with the process, and a
+//! signal handler could not read it anyway because it sits behind a `Mutex`.
+//! The shared ring is a memory-mapped file written without locks, so it
+//! outlives the crash and the monitor reads it from outside — see
+//! [`MonitorHandler::recover_trail`]. Without that feature a native-crash
+//! report carries no trail, which is a property of out-of-process capture
+//! rather than of the schema.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -41,6 +48,14 @@ const ENV_PROJECT: &str = "FAULTBOX_CRASH_PROJECT";
 const ENV_VERSION: &str = "FAULTBOX_CRASH_VERSION";
 const ENV_GIT_SHA: &str = "FAULTBOX_CRASH_GIT_SHA";
 const ENV_BUILD_ID: &str = "FAULTBOX_CRASH_BUILD_ID";
+/// Path of the shared breadcrumb ring, when one is configured.
+///
+/// This is what lets a native-crash report carry a trail at all. The in-process
+/// recorder dies with the process and could not be read from a signal handler
+/// anyway (it is behind a `Mutex`), but the shared ring is a memory-mapped
+/// *file* — it outlives the crash, and the monitor reads it from outside.
+#[cfg(feature = "shared-ring")]
+const ENV_SHARED_RING: &str = "FAULTBOX_CRASH_SHARED_RING";
 
 /// Keeps the crash handler and IPC client alive for the process's lifetime.
 /// Dropping either would uninstall the hooks, so they are parked here.
@@ -146,6 +161,10 @@ fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
     }
     if let Some(bid) = &cfg.build_id {
         cmd.env(ENV_BUILD_ID, bid);
+    }
+    #[cfg(feature = "shared-ring")]
+    if let Some(ring) = &cfg.shared_ring {
+        cmd.env(ENV_SHARED_RING, ring.path());
     }
     #[cfg(unix)]
     {
@@ -273,6 +292,9 @@ struct MonitorHandler {
     version: String,
     git_sha: Option<String>,
     build_id: Option<String>,
+    /// Where the crashed process's shared breadcrumb ring lives, if it had one.
+    #[cfg(feature = "shared-ring")]
+    shared_ring: Option<PathBuf>,
 }
 
 impl MonitorHandler {
@@ -285,6 +307,49 @@ impl MonitorHandler {
             version: opt(ENV_VERSION).unwrap_or_else(|| "0.0.0".to_owned()),
             git_sha: opt(ENV_GIT_SHA),
             build_id: opt(ENV_BUILD_ID),
+            #[cfg(feature = "shared-ring")]
+            shared_ring: opt(ENV_SHARED_RING).map(PathBuf::from),
+        }
+    }
+
+    /// Recover the breadcrumb trail of the process that just died.
+    ///
+    /// The in-process recorder is gone with it, and could not have been read
+    /// from the signal handler regardless — it is behind a `Mutex`, which is not
+    /// async-signal-safe. The shared ring is different: it is a memory-mapped
+    /// file, written lock-free, so it survives the crash and can be read from
+    /// out here, after the fact, in total safety.
+    ///
+    /// Slots the dying process had claimed but not finished are skipped by the
+    /// seqlock — a process killed mid-write costs exactly one crumb.
+    ///
+    /// Contents are already redacted: `breadcrumbs::record` redacts on the way
+    /// *into* the ring precisely because this reader has no access to the
+    /// crashed process's redactor.
+    fn recover_trail(&self) -> Vec<crate::breadcrumbs::Breadcrumb> {
+        #[cfg(feature = "shared-ring")]
+        {
+            let Some(path) = &self.shared_ring else {
+                return Vec::new();
+            };
+            match crate::shared_ring::SharedRing::join(path) {
+                Ok(Some(ring)) => ring.snapshot(),
+                Ok(None) => {
+                    eprintln!(
+                        "faultbox monitor: no breadcrumb ring at {}; report will have no trail",
+                        path.display()
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    eprintln!("faultbox monitor: cannot read breadcrumb ring: {e}");
+                    Vec::new()
+                }
+            }
+        }
+        #[cfg(not(feature = "shared-ring"))]
+        {
+            Vec::new()
         }
     }
 
@@ -324,7 +389,7 @@ impl MonitorHandler {
             },
             error_chain: Vec::new(),
             backtrace: Vec::new(),
-            breadcrumbs: Vec::new(),
+            breadcrumbs: self.recover_trail(),
             domain_kind: None,
             domain: serde_json::Value::Null,
             env: Env::current(),
@@ -405,6 +470,8 @@ mod tests {
             version: "0.1.0".to_owned(),
             git_sha: None,
             build_id: Some("deadbeef".to_owned()),
+            #[cfg(feature = "shared-ring")]
+            shared_ring: None,
         };
         // Simulate what the server does: a report dir with the minidump already
         // written into it as `minidump`.

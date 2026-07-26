@@ -195,6 +195,10 @@ It uses no locks — a slot is claimed with one atomic increment and published w
 
 An existing ring is joined as-is and **its** capacity is adopted, even if this caller asked for a different one; `capacity()` reports what you actually got. Resizing a file that other processes have mapped would leave their mappings pointing past end-of-file, and their next breadcrumb would take SIGBUS — a recorder must not be able to kill the processes it is watching because two of them disagreed about a number.
 
+Because the ring is a file, it also outlives the process that wrote it. With `native-crash` enabled as well, the crash monitor recovers the trail after a fatal signal and writes it into the report — so a native crash arrives with the operations that led up to it instead of a bare minidump. The in-process recorder cannot do this: it dies with the process, and a signal handler could not read it in any case, because it sits behind a `Mutex`.
+
+Crumbs are redacted on the way *into* the ring rather than on the way out of a report. The monitor is a separate process with no access to your `Redactor`, so anything written to the ring has to be safe already.
+
 ### `native-crash` requires one line in `main`
 
 The monitor is a re-exec of the host binary, so it needs `main` to identify itself. **This call is mandatory** whenever the handler is armed:

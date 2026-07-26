@@ -558,10 +558,18 @@ fn commit_pending(
 /// usually happened somewhere else.
 fn redacted_breadcrumbs(_cfg: &Config, redactor: &dyn Redactor) -> Vec<breadcrumbs::Breadcrumb> {
     let mut crumbs = breadcrumbs::snapshot();
+    for c in &mut crumbs {
+        c.message = redactor.redact(&c.message);
+        redactor.redact_json(&mut c.fields);
+    }
 
     #[cfg(feature = "shared-ring")]
     if let Some(ring) = &_cfg.shared_ring {
         let me = std::process::id();
+        // Ring crumbs were redacted on the way *in* (see `breadcrumbs::record`),
+        // so they are appended after the loop above rather than run through the
+        // redactor a second time — a caller's redactor is not required to be
+        // idempotent.
         crumbs.extend(
             ring.snapshot()
                 .into_iter()
@@ -571,10 +579,6 @@ fn redacted_breadcrumbs(_cfg: &Config, redactor: &dyn Redactor) -> Vec<breadcrum
         crumbs.sort_by_key(|c| c.ts_ms);
     }
 
-    for c in &mut crumbs {
-        c.message = redactor.redact(&c.message);
-        redactor.redact_json(&mut c.fields);
-    }
     crumbs
 }
 

@@ -32,8 +32,10 @@ fn main() {
     let mode = args.get(1).map(String::as_str).unwrap_or("");
     match mode {
         // Arm the native-crash handler and then take a real SIGSEGV, so the
-        // out-of-process monitor has to produce an actual minidump.
-        "crash" => crash(PathBuf::from(&args[2])),
+        // out-of-process monitor has to produce an actual minidump. An optional
+        // third argument attaches a shared breadcrumb ring, whose trail the
+        // monitor must recover from the dead process.
+        "crash" => crash(PathBuf::from(&args[2]), args.get(3).map(PathBuf::from)),
         // Arm the handler in a process that skipped the divert call. The guard
         // must exit(70) instead of spawning another copy of this binary.
         "guard" => guard(PathBuf::from(&args[2])),
@@ -54,8 +56,23 @@ fn config(reports_dir: PathBuf) -> faultbox::Config {
 }
 
 #[cfg(feature = "native-crash")]
-fn crash(reports_dir: PathBuf) -> ! {
-    faultbox::init(config(reports_dir).install_native_crash_handler(true));
+fn crash(reports_dir: PathBuf, ring_path: Option<PathBuf>) -> ! {
+    let mut cfg = config(reports_dir).install_native_crash_handler(true);
+
+    #[cfg(feature = "shared-ring")]
+    if let Some(path) = &ring_path {
+        let ring = faultbox::shared_ring::SharedRing::open(path, 256).expect("open ring");
+        cfg = cfg.shared_ring(std::sync::Arc::new(ring));
+    }
+    let _ = &ring_path;
+
+    faultbox::init(cfg);
+
+    // Operations leading up to the fault. These go to the shared ring, which
+    // survives this process; the in-process recorder does not.
+    faultbox::breadcrumb!(Info, "helper.open", "opened store");
+    faultbox::breadcrumb!(Warn, "helper.verify", "checksum looked wrong");
+
     // Give the handler a moment to finish attaching before faulting.
     std::thread::sleep(std::time::Duration::from_millis(200));
     // SAFETY: intentionally dereferencing null to raise SIGSEGV. This is the
@@ -67,7 +84,7 @@ fn crash(reports_dir: PathBuf) -> ! {
 }
 
 #[cfg(not(feature = "native-crash"))]
-fn crash(_reports_dir: PathBuf) -> ! {
+fn crash(_reports_dir: PathBuf, _ring_path: Option<PathBuf>) -> ! {
     std::process::exit(3);
 }
 

@@ -110,8 +110,19 @@ pub fn record(
     let message = message.into();
 
     #[cfg(feature = "shared-ring")]
-    if let Some(ring) = crate::config().and_then(|c| c.shared_ring.as_ref()) {
-        ring.record(level, &category, &message);
+    if let Some(cfg) = crate::config()
+        && let Some(ring) = cfg.shared_ring.as_ref()
+    {
+        // Redact BEFORE the bytes leave this process. The ring is a durable,
+        // cross-process artifact: another process — including the crash monitor,
+        // which has no access to this process's redactor — will read it back and
+        // write it into a report. Redacting only on the way *out* of a report
+        // would therefore leak, so the invariant is that nothing unredacted is
+        // ever written to the ring in the first place.
+        //
+        // The category is a developer-authored target name, not user data, and
+        // is left alone — matching how local crumbs are treated.
+        ring.record(level, &category, &cfg.redactor.redact(&message));
     }
 
     rec.record(Breadcrumb {

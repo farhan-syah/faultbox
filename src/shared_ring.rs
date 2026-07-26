@@ -42,7 +42,7 @@
 //! but a hostile writer with access to the store has better things to corrupt.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::MmapMut;
@@ -84,6 +84,7 @@ const HEADER: usize = 64;
 pub struct SharedRing {
     map: MmapMut,
     capacity: u64,
+    path: PathBuf,
 }
 
 // The mapping is shared, and every access goes through atomics or through
@@ -112,8 +113,9 @@ impl SharedRing {
     /// at the requested capacity.
     pub fn open(path: impl AsRef<Path>, capacity: usize) -> io::Result<SharedRing> {
         let capacity = capacity.max(1);
+        let path = path.as_ref();
 
-        if let Some(parent) = path.as_ref().parent() {
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file = std::fs::OpenOptions::new()
@@ -124,40 +126,21 @@ impl SharedRing {
             .open(path)?;
 
         // Join an existing ring if the file already describes one coherently.
-        let existing = file.metadata()?.len();
-        if existing >= HEADER as u64 {
-            // SAFETY: the file is at least HEADER bytes and stays mapped for the
-            // lifetime of the value; concurrent mutation by other processes is
-            // the intended design and every access is atomic or bounds-checked.
-            let map = unsafe { MmapMut::map_mut(&file)? };
-            let ring = SharedRing { map, capacity: 1 };
-            let magic = ring.header(HDR_MAGIC).load(Ordering::Acquire);
-            let found = ring.header(HDR_CAPACITY).load(Ordering::Acquire);
-            // The header must agree with the file's actual size, or it is not a
-            // ring we can safely address.
-            let coherent = magic == MAGIC
-                && found > 0
-                && usize::try_from(found)
-                    .ok()
-                    .and_then(|c| c.checked_mul(SLOT))
-                    .and_then(|b| b.checked_add(HEADER))
-                    .is_some_and(|want| want as u64 == existing);
-            if coherent {
-                return Ok(SharedRing {
-                    capacity: found,
-                    ..ring
-                });
-            }
+        if let Some(ring) = Self::try_join(&file, path)? {
+            return Ok(ring);
         }
 
         // Not a usable ring: create it at the requested capacity.
         let len = HEADER + capacity * SLOT;
         file.set_len(len as u64)?;
-        // SAFETY: as above; the file was just sized to `len`.
+        // SAFETY: the file was just sized to `len` and stays mapped for the
+        // lifetime of the value; concurrent mutation by other processes is the
+        // intended design and every access is atomic or bounds-checked.
         let map = unsafe { MmapMut::map_mut(&file)? };
         let ring = SharedRing {
             map,
             capacity: capacity as u64,
+            path: path.to_path_buf(),
         };
         ring.header(HDR_TICKET).store(0, Ordering::Release);
         for slot in 0..capacity {
@@ -171,11 +154,70 @@ impl SharedRing {
         Ok(ring)
     }
 
+    /// Join an existing ring **without ever creating or resizing one**.
+    ///
+    /// Returns `None` when `path` is absent or is not a coherent ring. This is
+    /// what a post-mortem reader wants: the crash monitor attaches to the dead
+    /// process's trail, and must not conjure an empty ring if the path is wrong
+    /// — that would silently report "no breadcrumbs" instead of "misconfigured".
+    pub fn join(path: impl AsRef<Path>) -> io::Result<Option<SharedRing>> {
+        let path = path.as_ref();
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Self::try_join(&file, path)
+    }
+
+    /// Map `file` as a ring if its header is coherent with its actual size.
+    fn try_join(file: &std::fs::File, path: &Path) -> io::Result<Option<SharedRing>> {
+        let existing = file.metadata()?.len();
+        if existing < HEADER as u64 {
+            return Ok(None);
+        }
+        // SAFETY: the file is at least HEADER bytes and stays mapped for the
+        // lifetime of the value; concurrent mutation by other processes is the
+        // intended design and every access is atomic or bounds-checked.
+        let map = unsafe { MmapMut::map_mut(file)? };
+        let ring = SharedRing {
+            map,
+            capacity: 1,
+            path: path.to_path_buf(),
+        };
+        let magic = ring.header(HDR_MAGIC).load(Ordering::Acquire);
+        let found = ring.header(HDR_CAPACITY).load(Ordering::Acquire);
+        // The header must agree with the file's actual size, or it is not a
+        // ring we can safely address.
+        let coherent = magic == MAGIC
+            && found > 0
+            && usize::try_from(found)
+                .ok()
+                .and_then(|c| c.checked_mul(SLOT))
+                .and_then(|b| b.checked_add(HEADER))
+                .is_some_and(|want| want as u64 == existing);
+        Ok(coherent.then(|| SharedRing {
+            capacity: found,
+            ..ring
+        }))
+    }
+
     /// The capacity actually in use — the creator's, which may differ from the
     /// value this process passed to [`open`](Self::open).
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity as usize
+    }
+
+    /// The file backing this ring. The crash monitor is told this path so it can
+    /// recover the trail of a process that has already died.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Append a breadcrumb. Never blocks, never allocates, and silently

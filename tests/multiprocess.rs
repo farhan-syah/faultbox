@@ -203,6 +203,58 @@ fn a_real_segfault_produces_a_minidump_and_a_native_crash_report() {
     );
 }
 
+/// A native crash must carry the breadcrumb trail that led to it.
+///
+/// This is the whole reason the shared ring is a memory-mapped *file* rather
+/// than process memory. The in-process recorder dies with the process, and a
+/// signal handler could not read it anyway — it sits behind a `Mutex`. The ring
+/// outlives the crash, so the monitor recovers the trail from outside, turning
+/// "here is a minidump, good luck" into "here is what the process was doing".
+#[cfg(all(feature = "native-crash", feature = "shared-ring"))]
+#[test]
+fn a_native_crash_report_carries_the_trail_recovered_from_the_shared_ring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reports = tmp.path().join("reports");
+    let ring = tmp.path().join("ring");
+
+    let status = Command::new(helper())
+        .args(["crash", reports.to_str().unwrap(), ring.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn helper");
+    assert!(!status.success(), "the helper must die of the fault");
+
+    let landed = wait_until(Duration::from_secs(20), || {
+        sole_group(&reports).is_some_and(|dir| dir.join("report.json").is_file())
+    });
+    assert!(landed, "no native-crash report appeared");
+
+    let dir = sole_group(&reports).unwrap();
+    let group = faultbox::reader::load(&dir).expect("report loads");
+    assert_eq!(group.first.kind, faultbox::EventKind::NativeCrash);
+
+    let trail: Vec<&str> = group
+        .first
+        .breadcrumbs
+        .iter()
+        .map(|c| c.category.as_str())
+        .collect();
+    assert_eq!(
+        trail,
+        ["helper.open", "helper.verify"],
+        "the monitor must recover the dead process's trail, in order"
+    );
+    assert_eq!(group.first.breadcrumbs[1].message, "checksum looked wrong");
+
+    // Attributed to the process that died — not the monitor that wrote it.
+    let crumb_pid = group.first.breadcrumbs[0].pid.expect("crumbs carry a pid");
+    assert_ne!(
+        crumb_pid, group.first.meta.pid,
+        "the trail belongs to the crashed process, not the monitor"
+    );
+}
+
 /// Several processes hitting the same bug at once must coalesce into one group
 /// with an exact occurrence count.
 ///
