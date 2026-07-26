@@ -942,7 +942,12 @@ mod tests {
         // Backdate it well past the staleness window — a holder that crashed.
         let stale = std::time::SystemTime::now()
             - std::time::Duration::from_millis(LOCK_STALE_MS as u64 * 2);
-        std::fs::File::open(&lock_path)
+        // Opened for writing, not with `File::open`: Windows needs write access
+        // to set file times and returns "Access is denied" on a read-only
+        // handle, so the read-only form fails there while passing on unix.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
             .unwrap()
             .set_modified(stale)
             .unwrap();
