@@ -9,13 +9,14 @@ Releases are cut from this file: the release workflow refuses a tag whose base v
 
 <!-- Link definitions live above the first section: everything below a version heading is extracted verbatim into that release's notes. -->
 
-[unreleased]: https://github.com/farhan-syah/faultbox/compare/v0.1.1...HEAD
+[unreleased]: https://github.com/farhan-syah/faultbox/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/farhan-syah/faultbox/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/farhan-syah/faultbox/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/farhan-syah/faultbox/releases/tag/v0.1.0
 
 ---
 
-## [Unreleased]
+## [0.1.2] - 2026-07-27
 
 A hardening release from an internal audit. Nothing is removed from the public API and no existing signature changes, so upgrading is a drop-in. `cargo deny check` reports no advisories anywhere in the dependency tree.
 

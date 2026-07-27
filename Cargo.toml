@@ -1,6 +1,6 @@
 [package]
 name = "faultbox"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # 1.88 for let-chains, which this crate uses directly. The `native-crash`
 # dependency tree (crash-context, minidump-writer) also requires 1.88.
