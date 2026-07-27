@@ -16,15 +16,24 @@ pub const REDACTED_DEPTH: &str = "[redacted: nesting too deep]";
 /// the subtree wholesale.
 ///
 /// The walk is recursive, and it runs inside the panic hook over values the
-/// adopter built — which may include JSON they parsed from a request. Without a
-/// bound, a deeply nested payload overflows the stack *while a panic is being
-/// reported*, turning a diagnosable failure into an unexplained abort and losing
-/// the report that would have explained it.
+/// adopter built — which may include JSON they parsed from a request. Each level
+/// costs several frames here (the walk re-enters itself through
+/// `redact_value_for_key`), so an unbounded walk would add substantially more
+/// stack per level than the structure itself occupies, and overflow *while a
+/// panic is being reported* — turning a diagnosable failure into an unexplained
+/// abort and losing the report that would have explained it.
 ///
 /// Anything past this depth is masked rather than descended into, so the failure
 /// direction stays the safe one: unwalkable means redacted, never emitted raw.
 /// 64 is far past any real forensic payload — `serde_json`'s own parser stops
 /// at 128 — so nothing legitimate reaches it.
+///
+/// What this bounds is faultbox's *own* contribution. It cannot make an
+/// arbitrarily deep [`serde_json::Value`] safe in general: that type builds,
+/// clones and drops recursively, so a value deep enough to exhaust the stack
+/// would have done so before reaching a report — on construction, or on the drop
+/// at the end of the enclosing scope. Redaction simply stops being the part that
+/// pushes it over.
 pub const MAX_JSON_DEPTH: u32 = 64;
 
 /// Removes user data from report strings.

@@ -247,10 +247,22 @@ fn an_artifact_note_goes_through_the_redactor() {
     );
 }
 
-/// Redaction walks adopter-built JSON recursively, from inside the panic hook.
-/// Deep nesting used to mean a stack overflow while a panic was being reported.
+/// Redaction walks adopter-built JSON recursively, from inside the panic hook,
+/// so the walk is bounded at `MAX_JSON_DEPTH` and anything deeper is masked
+/// wholesale rather than descended into.
+///
+/// The nesting here is deliberately modest — a few multiples of the bound, not
+/// thousands of levels. Depth beyond that stops testing faultbox at all:
+/// `serde_json::Value` builds and *drops* recursively, so a value deep enough to
+/// exhaust the stack could never have been constructed for us to receive in the
+/// first place. An earlier version of this test used 5000 levels and died in
+/// `serde_json`'s own `Drop` — on a runner with a smaller stack than the machine
+/// it was written on, which is exactly the flake that teaches nothing.
+///
+/// What faultbox owns is that *its* walk adds a bounded amount of depth on top
+/// of whatever the adopter's structure already costs. That is what this asserts.
 #[test]
-fn deeply_nested_domain_context_is_masked_rather_than_overflowing_the_stack() {
+fn nesting_past_the_bound_is_masked_and_shallow_payloads_survive_intact() {
     let tmp = tempfile::tempdir().unwrap();
     let reports_dir = tmp.path().join("reports");
 
@@ -260,17 +272,18 @@ fn deeply_nested_domain_context_is_masked_rather_than_overflowing_the_stack() {
             .redactor(Box::new(faultbox::BasicRedactor::new().home("/home/ada"))),
     ));
 
-    // Far past any legitimate forensic payload, and past `serde_json`'s own
-    // parse limit, so nothing real is affected by the bound.
+    let depth = faultbox::redact::MAX_JSON_DEPTH as usize * 4;
     let mut deep = serde_json::json!({ "leaf": "sk-live-4242deadbeef4242" });
-    for _ in 0..5_000 {
+    for _ in 0..depth {
         deep = serde_json::json!({ "next": deep });
     }
 
     let ctx = faultbox::Adhoc {
         kind: "store.deep",
         key: "class=1".to_owned(),
-        value: deep,
+        // A shallow sibling that must come through untouched, so the bound is
+        // shown to be a ceiling rather than a blanket.
+        value: serde_json::json!({ "page_id": 828, "buried": deep }),
     };
 
     let dir = Capture::new(EventKind::Corruption, "deeply nested context")
@@ -278,11 +291,20 @@ fn deeply_nested_domain_context_is_masked_rather_than_overflowing_the_stack() {
         .emit()
         .expect("report written");
 
-    // It survived, and the payload buried underneath did not come out raw.
-    let text = std::fs::read_to_string(dir.join("report.json")).unwrap();
+    let report = load(&dir);
+    let text = serde_json::to_string(&report.domain).unwrap();
+
     assert!(
         !text.contains("sk-live-4242deadbeef4242"),
-        "an unwalkable subtree must be masked, never emitted"
+        "a subtree too deep to walk must be masked, never emitted: {text}"
+    );
+    assert!(
+        text.contains(faultbox::redact::REDACTED_DEPTH),
+        "the depth bound must be what stopped it, and must say so: {text}"
+    );
+    assert_eq!(
+        report.domain["page_id"], 828,
+        "an ordinary field beside the deep one is untouched"
     );
 }
 
