@@ -4,7 +4,7 @@
 
 use super::edit::chain;
 use super::keys::{KeyKind, classify};
-use super::redactor::{REDACTED, Redactor};
+use super::redactor::{MAX_JSON_DEPTH, REDACTED, Redactor};
 use super::values::is_credential_shaped;
 use super::{assignments, credentials, emails, home::Home};
 use std::borrow::Cow;
@@ -80,11 +80,28 @@ impl BasicRedactor {
     /// that a value was present and withheld, which `null` — indistinguishable
     /// from a field that was never set — would not tell them. Reports are read
     /// as free-form JSON, so nothing downstream is typed on these leaves.
+    ///
+    /// Bounded like the main walk: this recurses over a value the adopter built,
+    /// from inside the panic hook, so an adversarially nested payload must not
+    /// be able to exhaust the stack while a panic is being reported. Past the
+    /// bound the subtree is replaced outright — which is what this function was
+    /// going to do to every leaf in it anyway, so nothing escapes.
     fn mask_subtree(value: &mut serde_json::Value) {
+        Self::mask_subtree_at(value, 0);
+    }
+
+    fn mask_subtree_at(value: &mut serde_json::Value, depth: u32) {
+        if depth >= MAX_JSON_DEPTH {
+            *value = serde_json::Value::String(REDACTED.to_owned());
+            return;
+        }
         match value {
-            serde_json::Value::Array(items) => items.iter_mut().for_each(Self::mask_subtree),
+            serde_json::Value::Array(items) => items
+                .iter_mut()
+                .for_each(|item| Self::mask_subtree_at(item, depth + 1)),
             serde_json::Value::Object(map) => {
-                map.iter_mut().for_each(|(_k, v)| Self::mask_subtree(v));
+                map.iter_mut()
+                    .for_each(|(_k, v)| Self::mask_subtree_at(v, depth + 1));
             }
             serde_json::Value::Null => {}
             other => *other = serde_json::Value::String(REDACTED.to_owned()),
@@ -129,11 +146,27 @@ impl Redactor for BasicRedactor {
 
 /// A weak key masks only over a credential-shaped value — the JSON counterpart
 /// of the same rule the text scanner applies.
+///
+/// Depth-bounded for the same reason as [`BasicRedactor::mask_subtree`], and it
+/// answers `true` at the bound: a subtree too deep to inspect is treated as
+/// though it held a credential, so the weak key masks it rather than passing
+/// through something nobody looked at.
 fn credential_shaped_leaf(value: &serde_json::Value) -> bool {
+    credential_shaped_leaf_at(value, 0)
+}
+
+fn credential_shaped_leaf_at(value: &serde_json::Value, depth: u32) -> bool {
+    if depth >= MAX_JSON_DEPTH {
+        return true;
+    }
     match value {
         serde_json::Value::String(s) => is_credential_shaped(s),
-        serde_json::Value::Array(items) => items.iter().any(credential_shaped_leaf),
-        serde_json::Value::Object(map) => map.values().any(credential_shaped_leaf),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| credential_shaped_leaf_at(item, depth + 1)),
+        serde_json::Value::Object(map) => map
+            .values()
+            .any(|v| credential_shaped_leaf_at(v, depth + 1)),
         _ => false,
     }
 }

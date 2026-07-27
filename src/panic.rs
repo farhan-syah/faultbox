@@ -52,9 +52,12 @@ pub(crate) fn install_hook() {
         let reentered = CAPTURING.with(|c| c.replace(true));
         if !reentered {
             // The capture path allocates, runs adopter-supplied redactor code,
-            // and touches the filesystem — all of which can panic.
-            let message = panic_message(info);
+            // and touches the filesystem — all of which can panic. Reading the
+            // panic payload is inside the guard too: it is the least likely step
+            // to fail, but a panic there would escape a hook that is already
+            // running during a panic, and that is an abort.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let message = panic_message(info);
                 let bt = Backtrace::force_capture();
                 crate::Capture::new(EventKind::Panic, message)
                     .backtrace_frames(frames_from_backtrace(&bt))

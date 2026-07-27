@@ -26,4 +26,4 @@ mod values;
 
 pub use basic::BasicRedactor;
 pub use noop::NoopRedactor;
-pub use redactor::{REDACTED, REDACTED_EMAIL, Redactor};
+pub use redactor::{MAX_JSON_DEPTH, REDACTED, REDACTED_DEPTH, REDACTED_EMAIL, Redactor};

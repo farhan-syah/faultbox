@@ -29,12 +29,14 @@
 pub mod breadcrumbs;
 pub mod build_id;
 pub mod context;
+pub mod digest;
 #[cfg(feature = "native-crash")]
 pub mod native;
 pub mod panic;
 pub mod reader;
 pub mod redact;
 pub mod report;
+pub mod secure_fs;
 #[cfg(feature = "shared-ring")]
 pub mod shared_ring;
 #[cfg(feature = "tracing")]
@@ -227,11 +229,10 @@ pub fn init(config: Config) -> bool {
         panic::install_hook();
     }
     #[cfg(feature = "native-crash")]
+    if let Some(cfg) = CONFIG.get()
+        && cfg.install_native_crash_handler
     {
-        let cfg = CONFIG.get().expect("config was just set");
-        if cfg.install_native_crash_handler {
-            native::install(cfg);
-        }
+        native::install(cfg);
     }
     true
 }
@@ -362,11 +363,33 @@ impl Capture {
     }
 
     /// Attach project-specific forensic context and adopt its grouping key.
+    ///
+    /// # Panics
+    ///
+    /// Never — including when the [`DomainContext`] implementation itself
+    /// panics. Serializing forensic context is exactly the code most likely to
+    /// misbehave while a system is already failing: it reaches into the very
+    /// structures whose corruption is being reported, and an index or `unwrap`
+    /// that holds in a healthy process need not hold in this one. Losing the
+    /// context is a worse report; taking the process down at the detection site
+    /// is a worse outcome.
+    ///
+    /// A panicking implementation therefore leaves the payload empty and the
+    /// capture usable, so the report still records that the site fired.
     #[must_use]
     pub fn domain(mut self, ctx: &dyn DomainContext) -> Self {
-        self.domain_kind = Some(ctx.domain_kind().to_owned());
-        self.domain_key = ctx.grouping_key();
-        self.domain = ctx.to_json();
+        let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (
+                ctx.domain_kind().to_owned(),
+                ctx.grouping_key(),
+                ctx.to_json(),
+            )
+        }));
+        if let Ok((kind, key, json)) = captured {
+            self.domain_kind = Some(kind);
+            self.domain_key = key;
+            self.domain = json;
+        }
         self
     }
 
@@ -411,8 +434,34 @@ impl Capture {
     /// Reports **coalesce by fingerprint**: repeated captures of one bug land in
     /// the same directory, bumping [`Report::occurrences`] and refreshing
     /// `latest.json`, rather than writing a directory per occurrence.
+    ///
+    /// # Panics
+    ///
+    /// Never. That is a guarantee, not an aspiration: this runs at a detection
+    /// site in a process that is already in trouble, and often from inside the
+    /// panic hook, where a second panic is an abort that destroys the report.
+    ///
+    /// Making it true takes more than avoiding `unwrap` in this crate, because
+    /// the capture path calls *adopter* code — [`Redactor::redact`] on every
+    /// string, and `Redactor::redact_json` over the domain payload. A panicking
+    /// redactor would otherwise take the application down from a logging-shaped
+    /// call, so the whole capture is unwind-guarded and a panic simply yields
+    /// `None`.
+    ///
+    /// Note the direction of that failure: a panic part-way through redaction
+    /// abandons the report entirely rather than writing what had been redacted
+    /// so far. A missing report costs a debugging session; a half-redacted one
+    /// costs the secret.
+    ///
+    /// Nothing can be done about a build using `panic = "abort"`, where no
+    /// unwind is catchable — there, an adopter's redactor must not panic.
     #[must_use]
     pub fn emit(self) -> Option<PathBuf> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || self.emit_inner()))
+            .unwrap_or(None)
+    }
+
+    fn emit_inner(self) -> Option<PathBuf> {
         let cfg = CONFIG.get()?;
         let redactor = cfg.redactor.as_ref();
 
@@ -425,6 +474,21 @@ impl Capture {
         let mut domain = self.domain;
         redactor.redact_json(&mut domain);
         let breadcrumbs = redacted_breadcrumbs(cfg, redactor);
+        // A backtrace is rendered text, and what it renders is the build
+        // machine's absolute source paths — `/home/<user>/…` and the crate
+        // paths under it — plus whatever an adopter's symbol names happen to
+        // spell. A report is meant to be submittable, so this goes through the
+        // redactor like every other string, rather than being the one channel
+        // that bypasses it.
+        let backtrace: Vec<Frame> = self
+            .backtrace
+            .into_iter()
+            .map(|frame| Frame {
+                address: frame.address,
+                symbol: frame.symbol.as_deref().map(|s| redactor.redact(s)),
+                location: frame.location.as_deref().map(|l| redactor.redact(l)),
+            })
+            .collect();
 
         // Fingerprint by (project, kind, detection site, failure-class key) so
         // the same bug at the same site collapses to one group, while distinct
@@ -448,10 +512,12 @@ impl Capture {
                 captured_at_ms: now,
                 pid: std::process::id(),
                 ppid: Meta::current_ppid(),
-                thread: Meta::current_thread_name(),
+                // Thread names are adopter-chosen and routinely carry the work
+                // item they were spawned for — a tenant, an account, a path.
+                thread: Meta::current_thread_name().map(|t| redactor.redact(&t)),
             },
             error_chain,
-            backtrace: self.backtrace,
+            backtrace,
             breadcrumbs,
             domain_kind: self.domain_kind,
             domain,
@@ -488,9 +554,27 @@ impl Capture {
         // Everything from here is fast, so the lock is held only briefly. A
         // supervisor restarting a crashing daemon has several processes racing
         // on exactly this directory.
-        let _lock = writer::lock_group(&dir).ok()?;
+        //
+        // Failing to take it means giving up *after* staging, which means
+        // throwing the staged bytes away. Staging names are unique, so an
+        // abandoned one is never overwritten by the next attempt — under a crash
+        // loop, silently leaving them would be an unbounded leak inside the very
+        // directory retention exists to bound.
+        let _lock = match writer::lock_group(&dir) {
+            Ok(lock) => lock,
+            Err(_) => {
+                for (_, staged) in staged {
+                    if let Ok(staged) = staged {
+                        staged.discard();
+                    }
+                }
+                return None;
+            }
+        };
         for (pending, staged) in staged {
-            report.artifacts.push(commit_pending(&dir, pending, staged));
+            report
+                .artifacts
+                .push(commit_pending(&dir, pending, staged, redactor));
         }
         writer::commit_into(&dir, &mut report).ok()?;
         drop(_lock);
@@ -503,47 +587,57 @@ impl Capture {
 /// refusal — into an [`Artifact`] entry. An artifact that could not be captured
 /// is recorded as such, because an analyst reading the report needs to know the
 /// snapshot is missing rather than infer it from an absent field.
+///
+/// Every note is built through `redactor`. Notes are the one report field
+/// assembled *after* the redaction pass, and they interpolate exactly the things
+/// redaction exists to remove: the adopter's free-text note, the source path of
+/// the artifact (an absolute path under the user's home), and an `io::Error`
+/// whose `Display` also renders that path.
 fn commit_pending(
     dir: &std::path::Path,
     pending: &PendingArtifact,
     staged: std::io::Result<writer::Staged>,
+    redactor: &dyn Redactor,
 ) -> Artifact {
-    let note_with = |extra: &str| {
-        Some(match &pending.note {
-            Some(n) => format!("{n} ({extra})"),
-            None => extra.to_owned(),
-        })
+    let note = |extra: Option<&str>| {
+        let text = match (&pending.note, extra) {
+            (Some(n), Some(extra)) => format!("{n} ({extra})"),
+            (Some(n), None) => n.clone(),
+            (None, Some(extra)) => extra.to_owned(),
+            (None, None) => return None,
+        };
+        Some(redactor.redact(&text))
     };
     match staged.and_then(|s| writer::commit_artifact(dir, s)) {
         Ok(writer::Preserved::Copied { rel, bytes, digest }) => Artifact {
             kind: pending.kind.clone(),
             rel_path: rel,
-            note: pending.note.clone(),
+            note: note(None),
             digest: Some(digest),
             bytes: Some(bytes),
         },
         Ok(writer::Preserved::Reused { rel, bytes, digest }) => Artifact {
             kind: pending.kind.clone(),
             rel_path: rel,
-            note: note_with("unchanged since an earlier occurrence of this bug"),
+            note: note(Some("unchanged since an earlier occurrence of this bug")),
             digest: Some(digest),
             bytes: Some(bytes),
         },
         Ok(writer::Preserved::TooLarge { bytes, limit }) => Artifact {
             kind: pending.kind.clone(),
             rel_path: String::new(),
-            note: note_with(&format!(
+            note: note(Some(&format!(
                 "NOT PRESERVED: {bytes} bytes exceeds the {limit}-byte cap; \
                  the source was left in place at {}",
                 pending.src.display()
-            )),
+            ))),
             digest: None,
             bytes: Some(bytes),
         },
         Err(e) => Artifact {
             kind: pending.kind.clone(),
             rel_path: String::new(),
-            note: note_with(&format!("NOT PRESERVED: {e}")),
+            note: note(Some(&format!("NOT PRESERVED: {e}"))),
             digest: None,
             bytes: None,
         },

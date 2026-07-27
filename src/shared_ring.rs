@@ -36,14 +36,29 @@
 //! ## Trust boundary
 //!
 //! The ring file is shared mutable state. Only processes already trusted with
-//! the artifact should be able to write it — give it the same permissions as
-//! the store. A hostile writer can garble the trail (it cannot escape the
+//! the artifact should be able to write it, so it is created owner-only and a
+//! deployment that genuinely shares a store between accounts must widen it
+//! deliberately. A hostile writer can garble the trail (it cannot escape the
 //! mapping: every read is bounds-checked and every string is validated UTF-8),
 //! but a hostile writer with access to the store has better things to corrupt.
+//!
+//! ## Why every byte is an atomic
+//!
+//! Other processes write this mapping while we read it. Forming a `&[u8]` or a
+//! `&mut [u8]` over memory that can change underneath the reference is undefined
+//! behaviour in Rust — a data race — no matter how carefully the seqlock
+//! sequences the *logical* reads and writes. The seqlock decides which crumbs
+//! are trustworthy; it cannot make a racing non-atomic access defined.
+//!
+//! So the mapping is never viewed as a slice. Payload bytes are read and written
+//! one relaxed [`AtomicU8`] at a time, and a reader copies the slot into local
+//! memory before parsing it, so all the shape-checking happens on bytes nothing
+//! else can touch. Relaxed suffices because the sequence number's
+//! release/acquire pair supplies the ordering.
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use memmap2::MmapMut;
 
@@ -75,6 +90,18 @@ const HDR_MAGIC: usize = 0;
 const HDR_CAPACITY: usize = 8;
 const HDR_TICKET: usize = 16;
 const HEADER: usize = 64;
+
+/// The largest ring this crate will create: 1M slots, a 256 MiB mapping.
+/// [`SharedRing::open`] clamps to it.
+///
+/// A bound rather than a comment, because the file length is
+/// `HEADER + capacity * SLOT` and `capacity` arrives from the caller. Left
+/// unchecked, a large value wraps that multiplication in a release build: the
+/// file is then created *small* while the ring keeps addressing the capacity it
+/// was asked for, and the very first `record` writes far past the end of the
+/// mapping. A breadcrumb ring has no legitimate use anywhere near this size, so
+/// the cap costs nothing and removes the overflow entirely.
+pub const MAX_CAPACITY: usize = 1 << 20;
 
 /// A bounded breadcrumb trail shared by every process that opens the same file.
 ///
@@ -110,28 +137,43 @@ impl SharedRing {
     /// disagreed about a capacity.
     ///
     /// A file that is absent, empty, or not a recognizable ring is (re)created
-    /// at the requested capacity.
+    /// at the requested capacity, clamped to [`MAX_CAPACITY`].
     pub fn open(path: impl AsRef<Path>, capacity: usize) -> io::Result<SharedRing> {
-        let capacity = capacity.max(1);
+        let capacity = capacity.clamp(1, MAX_CAPACITY);
         let path = path.as_ref();
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::secure_fs::create_dir_all_private(parent)?;
         }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // Owner-only on creation. The trail is redacted on the way in, but it
+        // still describes what the process was doing, and a ring beside a store
+        // has no reason to be readable by other local accounts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
 
         // Join an existing ring if the file already describes one coherently.
         if let Some(ring) = Self::try_join(&file, path)? {
             return Ok(ring);
         }
 
-        // Not a usable ring: create it at the requested capacity.
-        let len = HEADER + capacity * SLOT;
+        // Not a usable ring: create it at the requested capacity. Checked even
+        // though `capacity` is clamped above, so that a future change to the
+        // clamp cannot silently reintroduce a wrapping length.
+        let len = capacity
+            .checked_mul(SLOT)
+            .and_then(|body| body.checked_add(HEADER))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "shared ring capacity overflows the addressable file length",
+                )
+            })?;
         file.set_len(len as u64)?;
         // SAFETY: the file was just sized to `len` and stays mapped for the
         // lifetime of the value; concurrent mutation by other processes is the
@@ -144,7 +186,12 @@ impl SharedRing {
         };
         ring.header(HDR_TICKET).store(0, Ordering::Release);
         for slot in 0..capacity {
-            ring.slot_seq(slot as u64).store(0, Ordering::Release);
+            // The file was just sized to hold every one of these, so `slot_base`
+            // cannot refuse — but going through it keeps the bounds check on the
+            // one path that writes every slot in the ring.
+            if let Some(base) = ring.slot_base(slot as u64) {
+                ring.slot_seq_at(base).store(0, Ordering::Release);
+            }
         }
         ring.header(HDR_CAPACITY)
             .store(capacity as u64, Ordering::Release);
@@ -227,31 +274,37 @@ impl SharedRing {
         // mapping, so two processes can never claim the same ticket.
         let ticket = self.header(HDR_TICKET).fetch_add(1, Ordering::AcqRel);
         let slot = ticket % self.capacity;
+        // Refuse rather than write outside the mapping if the header ever
+        // disagrees with the file's real length. Nothing should be able to get
+        // here — `open` and `try_join` both prove the two agree — so this is the
+        // backstop that keeps a corrupt header a lost trail, not a memory bug.
+        let Some(base) = self.slot_base(slot) else {
+            return;
+        };
 
         // Mark the slot in-flight (odd) before touching the body, so a reader —
         // or a reader in another process after we are killed — knows not to
         // trust it.
-        let seq = self.slot_seq(slot);
+        let seq = self.slot_seq_at(base);
         seq.store((ticket << 1) | 1, Ordering::Release);
 
-        let base = HEADER + (slot as usize) * SLOT;
         let cat = clamp_utf8(category, PAYLOAD_CAP.min(u8::MAX as usize));
         let msg = clamp_utf8(message, PAYLOAD_CAP - cat.len());
 
-        // SAFETY: writing to our own mapping. Offsets are within the slot by
-        // construction: cat.len() + msg.len() <= PAYLOAD_CAP.
-        let body =
-            unsafe { std::slice::from_raw_parts_mut(self.map.as_ptr().cast_mut().add(base), SLOT) };
-        body[SLOT_TS..SLOT_TS + 8].copy_from_slice(&(crate::now_ms() as u64).to_le_bytes());
-        body[SLOT_LEVEL] = level_byte(level);
-        body[SLOT_PID..SLOT_PID + 4].copy_from_slice(&std::process::id().to_le_bytes());
-        body[SLOT_CAT_LEN] = cat.len() as u8;
-        body[SLOT_MSG_LEN..SLOT_MSG_LEN + 2].copy_from_slice(&(msg.len() as u16).to_le_bytes());
-        body[SLOT_PAYLOAD..SLOT_PAYLOAD + cat.len()].copy_from_slice(cat.as_bytes());
-        body[SLOT_PAYLOAD + cat.len()..SLOT_PAYLOAD + cat.len() + msg.len()]
-            .copy_from_slice(msg.as_bytes());
+        // Byte-at-a-time relaxed atomics rather than a slice: another process
+        // may be reading this slot right now, and a `&mut [u8]` over memory it
+        // can observe is a data race. Offsets stay within the slot by
+        // construction — `cat.len() + msg.len() <= PAYLOAD_CAP`.
+        self.write(base + SLOT_TS, &(crate::now_ms() as u64).to_le_bytes());
+        self.write(base + SLOT_LEVEL, &[level_byte(level)]);
+        self.write(base + SLOT_PID, &std::process::id().to_le_bytes());
+        self.write(base + SLOT_CAT_LEN, &[cat.len() as u8]);
+        self.write(base + SLOT_MSG_LEN, &(msg.len() as u16).to_le_bytes());
+        self.write(base + SLOT_PAYLOAD, cat.as_bytes());
+        self.write(base + SLOT_PAYLOAD + cat.len(), msg.as_bytes());
 
-        // Publish: even sequence means "this slot is complete".
+        // Publish: even sequence means "this slot is complete". The release
+        // pairs with the reader's acquire and orders every byte above.
         seq.store(ticket << 1, Ordering::Release);
     }
 
@@ -263,12 +316,15 @@ impl SharedRing {
     pub fn snapshot(&self) -> Vec<Breadcrumb> {
         let mut out: Vec<(u64, Breadcrumb)> = Vec::new();
         for slot in 0..self.capacity {
-            let seq_cell = self.slot_seq(slot);
+            let Some(base) = self.slot_base(slot) else {
+                continue;
+            };
+            let seq_cell = self.slot_seq_at(base);
             let before = seq_cell.load(Ordering::Acquire);
             if before & 1 == 1 {
                 continue; // in flight, or abandoned by a dead writer
             }
-            let Some(crumb) = self.read_slot(slot) else {
+            let Some(crumb) = self.read_slot(base) else {
                 continue;
             };
             // Re-check: a writer may have overwritten this slot underneath us.
@@ -286,9 +342,17 @@ impl SharedRing {
         out.into_iter().map(|(_, c)| c).collect()
     }
 
-    fn read_slot(&self, slot: u64) -> Option<Breadcrumb> {
-        let base = HEADER + (slot as usize) * SLOT;
-        let body = self.map.get(base..base + SLOT)?;
+    /// Parse the slot beginning at `base`, which must have come from
+    /// [`slot_base`](Self::slot_base).
+    fn read_slot(&self, base: usize) -> Option<Breadcrumb> {
+        // Copy the whole slot out before looking at any of it. Parsing straight
+        // from the mapping would mean reading bytes another process can rewrite
+        // mid-parse — and would also let a length validated in one read differ
+        // from the one used in the next. Local bytes have neither problem; if
+        // the copy was torn, the caller's sequence re-check discards it.
+        let mut body = [0u8; SLOT];
+        self.read(base, &mut body);
+
         let ts = u64::from_le_bytes(body[SLOT_TS..SLOT_TS + 8].try_into().ok()?);
         let level = byte_level(body[SLOT_LEVEL]);
         let cat_len = body[SLOT_CAT_LEN] as usize;
@@ -314,17 +378,63 @@ impl SharedRing {
         })
     }
 
+    /// Byte offset of `slot`, or `None` if it does not lie wholly inside the
+    /// mapping.
+    fn slot_base(&self, slot: u64) -> Option<usize> {
+        let base = HEADER.checked_add(usize::try_from(slot).ok()?.checked_mul(SLOT)?)?;
+        (base.checked_add(SLOT)? <= self.map.len()).then_some(base)
+    }
+
+    /// Copy `bytes` into the mapping at `offset`, one relaxed atomic store each.
+    ///
+    /// Callers must have proved the range lies inside the mapping (via
+    /// [`slot_base`](Self::slot_base)); the debug assertion catches a future
+    /// caller that forgets.
+    fn write(&self, offset: usize, bytes: &[u8]) {
+        debug_assert!(offset + bytes.len() <= self.map.len());
+        for (i, byte) in bytes.iter().enumerate() {
+            self.cell(offset + i).store(*byte, Ordering::Relaxed);
+        }
+    }
+
+    /// Copy `out.len()` bytes out of the mapping at `offset`.
+    fn read(&self, offset: usize, out: &mut [u8]) {
+        debug_assert!(offset + out.len() <= self.map.len());
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.cell(offset + i).load(Ordering::Relaxed);
+        }
+    }
+
+    /// One byte of the mapping, as an atomic.
+    ///
+    /// This is the only way payload bytes are touched. `AtomicU8` has no
+    /// alignment requirement beyond one byte, so every offset is valid, and
+    /// going through it is what makes concurrent access by another process
+    /// defined behaviour rather than a data race.
+    fn cell(&self, offset: usize) -> &AtomicU8 {
+        // SAFETY: `offset` is inside the mapping (checked by every caller's
+        // `slot_base`), the mapping outlives `&self`, and `AtomicU8` is
+        // 1-aligned so any byte offset is a valid place to put one.
+        unsafe { &*self.map.as_ptr().add(offset).cast::<AtomicU8>() }
+    }
+
     fn header(&self, offset: usize) -> &AtomicU64 {
         // SAFETY: the mapping is at least HEADER bytes and page-aligned, so an
         // 8-byte-aligned offset within the header is a valid AtomicU64.
         unsafe { &*self.map.as_ptr().add(offset).cast::<AtomicU64>() }
     }
 
-    fn slot_seq(&self, slot: u64) -> &AtomicU64 {
-        let offset = HEADER + (slot as usize) * SLOT + SLOT_SEQ;
-        // SAFETY: HEADER and SLOT are multiples of 8 and `slot < capacity`, so
-        // this is an 8-byte-aligned offset inside the mapping.
-        unsafe { &*self.map.as_ptr().add(offset).cast::<AtomicU64>() }
+    /// The sequence number of the slot beginning at `base`.
+    ///
+    /// Takes an offset rather than a slot index so that it can only be reached
+    /// through [`slot_base`](Self::slot_base), which is what proves the slot lies
+    /// inside the mapping. Taking an index here is how the bounds check came to
+    /// be skipped on the one path that did not go through it.
+    fn slot_seq_at(&self, base: usize) -> &AtomicU64 {
+        // SAFETY: `base` came from `slot_base`, so `base + SLOT` is within the
+        // mapping. HEADER and SLOT are multiples of 8, so `base + SLOT_SEQ` is
+        // 8-byte aligned and a valid place for an AtomicU64.
+        unsafe { &*self.map.as_ptr().add(base + SLOT_SEQ).cast::<AtomicU64>() }
     }
 }
 
@@ -421,7 +531,8 @@ mod tests {
         // Simulate a process killed between claiming a slot and publishing it:
         // ticket taken, sequence left odd.
         let ticket = ring.header(HDR_TICKET).fetch_add(1, Ordering::AcqRel);
-        ring.slot_seq(ticket % ring.capacity)
+        let base = ring.slot_base(ticket % ring.capacity).unwrap();
+        ring.slot_seq_at(base)
             .store((ticket << 1) | 1, Ordering::Release);
 
         ring.record(Level::Info, "t", "after");
@@ -487,6 +598,61 @@ mod tests {
         assert_eq!(crumbs.len(), 1, "a huge message still records");
         assert!(crumbs[0].message.len() <= PAYLOAD_CAP);
         assert!(crumbs[0].message.chars().all(|c| c == 'é'));
+    }
+
+    /// Regression: `HEADER + capacity * SLOT` used to be computed unchecked.
+    /// A capacity that wraps it produced a small file paired with a huge
+    /// `capacity` field, and the first `record` wrote far outside the mapping.
+    #[test]
+    fn an_overflowing_capacity_cannot_size_the_file_out_of_step_with_the_ring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ring");
+
+        // The exact shape that wrapped: `capacity * SLOT` overflows `usize`.
+        let ring = SharedRing::open(&path, usize::MAX / SLOT + 1).unwrap();
+
+        assert!(ring.capacity() <= MAX_CAPACITY, "capacity is clamped");
+        let expected = HEADER + ring.capacity() * SLOT;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            expected as u64,
+            "the file must be exactly as long as the ring believes it is"
+        );
+
+        // And the ring still works, rather than writing outside the mapping.
+        ring.record(Level::Info, "t", "after the clamp");
+        assert_eq!(ring.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn every_slot_addressed_by_the_ring_lies_inside_the_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ring = SharedRing::open(tmp.path().join("ring"), 32).unwrap();
+        for slot in 0..ring.capacity as u64 {
+            assert!(
+                ring.slot_base(slot).is_some(),
+                "slot {slot} must be addressable"
+            );
+        }
+        assert!(
+            ring.slot_base(ring.capacity).is_none(),
+            "one past the end must not be"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_created_ring_is_not_readable_by_other_accounts() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ring");
+        let _ring = SharedRing::open(&path, 4).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "the trail describes what the process was doing; keep it private"
+        );
     }
 
     #[test]

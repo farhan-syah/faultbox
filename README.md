@@ -164,6 +164,10 @@ A report directory is keyed by fingerprint and holds:
 └── store.corrupt/   preserved artifact, stored once
 ```
 
+On unix, everything in there is created owner-only — directories `0700`, files `0600`. Redaction cleans the report's _strings_, but the things travelling beside them cannot be redacted and were never meant to be: a preserved artifact is a verbatim copy of your store, and a minidump is the crashed process's entire address space. On a multi-user host those must not be readable by other local accounts, so the recorder does not leave the mode to the umask. A preserved artifact does not inherit a permissive mode from its source, either. (On Windows there are no mode bits: files inherit the parent's ACL, so the reports directory is as private as the location you point it at — put it under `%LOCALAPPDATA%`.)
+
+Artifact names are validated as a single plain path component: they are joined onto the report directory, so a name containing a separator or `..` would place the artifact — and the removal that precedes it — somewhere else entirely. A rejected name is recorded on the report as `NOT PRESERVED`, not silently dropped.
+
 A crash loop re-detecting one bug increments a counter instead of writing a new directory each time. This is not cosmetic: under a supervised restart loop, a per-occurrence layout writes thousands of directories for a single bug, each with its own copy of the store. Retention caps the directory, because a recorder that fills the disk of the process it monitors has done more damage than the bug it recorded.
 
 Because coalescing hides the true failure count behind a small directory listing, `reader::total_occurrences` gives you the honest number.

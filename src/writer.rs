@@ -29,11 +29,22 @@
 //! processes sharing a store) coordinate through a [`DirLock`] that is stolen
 //! after [`LOCK_STALE_MS`] so a process dying mid-update cannot wedge the group
 //! forever.
+//!
+//! ## Confidentiality
+//!
+//! Everything written here is owner-only: directories at `0700`, files at
+//! `0600`, temporary siblings created exclusively so a pre-planted symlink is
+//! refused rather than followed. A report's *strings* are redacted, but a
+//! preserved artifact is a verbatim copy of the adopter's data and cannot be —
+//! so the directory holding it must not be readable by other local accounts.
+//! See [`crate::secure_fs`].
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::digest::Sha256;
 use crate::report::{EventKind, Report};
+use crate::secure_fs;
 
 /// How long a lock file may go untouched before a competing writer assumes its
 /// holder died and steals it. Generous relative to the milliseconds an update
@@ -42,7 +53,12 @@ pub const LOCK_STALE_MS: u128 = 10_000;
 
 /// Deterministic 64-bit FNV-1a. Stable across builds and platforms, so the same
 /// failure fingerprints identically everywhere — unlike a `DefaultHasher`,
-/// whose seed varies. Used only for grouping/dedup, never for security.
+/// whose seed varies.
+///
+/// Used **only** to derive a grouping fingerprint, which has to be stable and
+/// cheap and is explicitly not a security boundary: the worst a collision can
+/// do is file two bugs in one directory. Artifact digests, which *are* relied on
+/// to tell one snapshot from another, use SHA-256 — see [`digest_of`].
 #[must_use]
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = FNV_OFFSET;
@@ -145,9 +161,14 @@ pub fn group_dir(reports_dir: &Path, fingerprint: &str) -> PathBuf {
 /// at which point a competing process steals the lock and writes the same
 /// destination concurrently.
 pub fn ensure_group_dir(reports_dir: &Path, fingerprint: &str) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(reports_dir)?;
+    secure_fs::create_dir_all_private(reports_dir)?;
     let dir = group_dir(reports_dir, fingerprint);
-    std::fs::create_dir_all(&dir)?;
+    secure_fs::create_dir_all_private(&dir)?;
+    // A group directory belongs entirely to the recorder, so narrowing it is
+    // safe even when it already existed — including one an earlier version of
+    // this crate created at the umask default, whose preserved artifacts would
+    // otherwise stay world-readable for as long as the group is retained.
+    secure_fs::harden_dir(&dir);
     Ok(dir)
 }
 
@@ -260,6 +281,20 @@ pub enum Staged {
     TooLarge { bytes: u64, limit: u64 },
 }
 
+impl Staged {
+    /// Throw away a staging path that will never be committed.
+    ///
+    /// A capture that stages an artifact and then cannot finish — it failed to
+    /// take the group lock, say — has already written the bytes. Since staging
+    /// names are unique, they would sit in the group directory forever, so the
+    /// abandoning caller says so explicitly.
+    pub fn discard(self) {
+        if let Staged::Ready { tmp, .. } = self {
+            let _ = remove_any(&tmp);
+        }
+    }
+}
+
 /// Digest a source artifact and copy it to a staging path beside its final
 /// destination — the slow half of preserving, deliberately done **without the
 /// group lock held**.
@@ -278,12 +313,19 @@ pub enum Staged {
 ///
 /// `max_bytes` caps the copy so preserving a store cannot fill the disk of the
 /// very daemon whose durability is in question.
+///
+/// `name` must be a plain file name. It is joined onto `report_dir`, so a name
+/// containing a separator or `..` would place the artifact — and the removal
+/// that precedes it — outside the reports directory altogether. Such a name is
+/// rejected here, and the refusal is recorded on the report rather than being
+/// fatal to the capture.
 pub fn stage_artifact(
     report_dir: &Path,
     src: &Path,
     name: &str,
     max_bytes: u64,
 ) -> io::Result<Staged> {
+    secure_fs::validate_artifact_name(name)?;
     let (bytes, digest) = digest_of(src)?;
     if bytes > max_bytes {
         return Ok(Staged::TooLarge {
@@ -304,22 +346,86 @@ pub fn stage_artifact(
         });
     }
 
-    let tmp = report_dir.join(format!("{name}.incoming.{}", std::process::id()));
-    remove_any(&tmp)?;
-    if src.is_dir() {
-        copy_dir_recursive(src, &tmp)?;
-    } else {
-        if let Some(parent) = tmp.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(src, &tmp)?;
-    }
+    // Staging names are unpredictable — a fixed one is a symlink-plant target —
+    // which means they no longer overwrite each other the way `.incoming.<pid>`
+    // did. So an abandoned one has to be collected rather than reused.
+    sweep_stale_staging(report_dir);
+
     Ok(Staged::Ready {
         name: name.to_owned(),
-        tmp,
+        tmp: stage_bytes(&dest, src)?,
         bytes,
         digest,
     })
+}
+
+/// Suffix identifying a staging path, so an abandoned one can be recognised.
+const STAGING_TAG: &str = "incoming";
+
+/// How long an abandoned staging path is left alone before a later capture
+/// collects it. Deliberately generous: preserving a multi-gigabyte store takes
+/// real time, and a *live* copy must never be mistaken for wreckage.
+const STAGING_STALE_MS: u128 = 60 * 60 * 1000;
+
+/// Copy `src` to a fresh staging path beside `dest`.
+///
+/// A failure part-way removes the partial copy. Without that, every failed
+/// preserve would leave its bytes in the group directory under a name nothing
+/// ever looks at again — and under a crash loop, that is an unbounded leak in
+/// the very directory retention is supposed to bound.
+fn stage_bytes(dest: &Path, src: &Path) -> io::Result<PathBuf> {
+    if src.is_dir() {
+        let tmp = secure_fs::create_temp_dir_beside(dest, STAGING_TAG)?;
+        if let Err(e) = copy_dir_recursive(src, &tmp) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        Ok(tmp)
+    } else {
+        let (mut file, tmp) = secure_fs::create_temp_beside(dest, STAGING_TAG)?;
+        let copied = std::fs::File::open(src)
+            .and_then(|mut source| io::copy(&mut source, &mut file))
+            .and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(tmp)
+    }
+}
+
+/// Remove staging and temporary paths left behind by a process that died
+/// mid-write, and only those: anything younger than [`STAGING_STALE_MS`] may
+/// still belong to a capture that is running right now, in this process or
+/// another one.
+///
+/// Best effort throughout — a report is never worth failing over housekeeping.
+fn sweep_stale_staging(report_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(report_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // One marker covers both staging copies and `atomic_write` siblings, and
+        // an artifact name may not contain it — so this can never match a
+        // preserved artifact.
+        if !name.contains(secure_fs::TEMP_INFIX) {
+            continue;
+        }
+        let abandoned = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age.as_millis() > STAGING_STALE_MS);
+        if abandoned {
+            let _ = remove_any(&entry.path());
+        }
+    }
 }
 
 /// Move a [`Staged`] artifact into its final name — the fast half, safe to run
@@ -343,8 +449,12 @@ pub fn commit_artifact(report_dir: &Path, staged: Staged) -> io::Result<Preserve
             digest,
         } => {
             let dest = report_dir.join(&name);
-            remove_any(&dest)?;
-            rename_over(&tmp, &dest)?;
+            if let Err(e) = remove_any(&dest).and_then(|()| rename_over(&tmp, &dest)) {
+                // The bytes never reached their name; leaving them under the
+                // staging one would strand them there.
+                let _ = remove_any(&tmp);
+                return Err(e);
+            }
             sync_dir(report_dir);
             Ok(Preserved::Copied {
                 rel: name,
@@ -385,34 +495,35 @@ pub fn preserve_artifact(
 
 /// Total size and content digest of a file or directory tree.
 ///
-/// The digest folds each entry's *relative path* and *contents* into one FNV-1a
-/// value, so it distinguishes both differing bytes and differing layout. Entry
-/// paths are sorted first so the digest does not depend on readdir order.
+/// The digest folds each entry's *relative path* and *contents* into one
+/// SHA-256, so it distinguishes both differing bytes and differing layout.
+/// Entry paths are sorted first so the digest does not depend on readdir order.
+///
+/// Cryptographic on purpose. This value decides whether a later occurrence of a
+/// bug may reuse the snapshot already on disk instead of preserving the state it
+/// actually saw, and it is published on the report as evidence the artifact
+/// arrived unaltered. A 64-bit non-cryptographic hash satisfies neither: a
+/// collision is constructible, and either claim then quietly becomes false.
 pub fn digest_of(path: &Path) -> io::Result<(u64, String)> {
-    let mut hash = FNV_OFFSET;
+    let mut hasher = Sha256::new();
     let mut total = 0u64;
     if path.is_dir() {
         let mut entries = Vec::new();
         collect_files(path, path, &mut entries)?;
         entries.sort();
         for rel in entries {
-            for b in rel.to_string_lossy().as_bytes() {
-                hash = fnv1a_step(hash, *b);
-            }
-            hash = fnv1a_step(hash, 0);
-            let (len, h) = digest_file(&path.join(&rel), hash)?;
-            hash = h;
-            total += len;
+            hasher.update(rel.to_string_lossy().as_bytes());
+            hasher.update(&[0]);
+            total = total.saturating_add(digest_file(&path.join(&rel), &mut hasher)?);
         }
     } else {
-        let (len, h) = digest_file(path, hash)?;
-        hash = h;
-        total = len;
+        total = digest_file(path, &mut hasher)?;
     }
-    Ok((total, format!("{hash:016x}")))
+    Ok((total, hasher.hex()))
 }
 
-fn digest_file(path: &Path, mut hash: u64) -> io::Result<(u64, u64)> {
+/// Fold one file's bytes into `hasher`, returning its length.
+fn digest_file(path: &Path, hasher: &mut Sha256) -> io::Result<u64> {
     let mut f = std::fs::File::open(path)?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut len = 0u64;
@@ -421,12 +532,10 @@ fn digest_file(path: &Path, mut hash: u64) -> io::Result<(u64, u64)> {
         if n == 0 {
             break;
         }
-        for &b in &buf[..n] {
-            hash = fnv1a_step(hash, b);
-        }
-        len += n as u64;
+        hasher.update(&buf[..n]);
+        len = len.saturating_add(n as u64);
     }
-    Ok((len, hash))
+    Ok(len)
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -572,11 +681,7 @@ impl DirLock {
         // permission problem — an unwritable directory — and must surface.
         let mut sharing_since: Option<std::time::Instant> = None;
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
+            match secure_fs::create_new_private(&path) {
                 Ok(mut f) => {
                     let _ = write!(f, "{}", std::process::id());
                     return Ok(DirLock { path });
@@ -675,13 +780,20 @@ fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Write `bytes` to `path` atomically *and* durably: to a temp sibling, fsync,
 /// rename, then fsync the containing directory so the rename itself is durable.
+///
+/// The sibling is created exclusively under an unpredictable name. A fixed one
+/// — `report.tmp.<pid>` was the earlier spelling — can be pre-created as a
+/// symlink by anyone who can write to the reports directory, and `File::create`
+/// would then follow it and write the report through, with the reporting
+/// process's privileges, into a file of the attacker's choosing.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    let (mut f, tmp) = secure_fs::create_temp_beside(path, "tmp")?;
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
+    drop(f);
     rename_over(&tmp, path)?;
     if let Some(parent) = path.parent() {
         sync_dir(parent);
@@ -699,7 +811,7 @@ fn sync_dir(dir: &Path) {
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dest)?;
+    secure_fs::create_dir_all_private(dest)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let ft = entry.file_type()?;
@@ -708,6 +820,10 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
             copy_dir_recursive(&entry.path(), &to)?;
         } else if ft.is_file() {
             std::fs::copy(entry.path(), &to)?;
+            // `fs::copy` carries the source's permissions across, so a store
+            // the adopter kept world-readable would arrive in the report that
+            // way too. The copy is ours now, and it is owner-only.
+            secure_fs::harden_file(&to);
         }
         // Symlinks/others are skipped: an artifact must be self-contained.
     }
@@ -967,6 +1083,104 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "staging paths must not leak: {leftovers:?}"
+        );
+    }
+
+    /// Staging names are unique, so an abandoned one is never overwritten by
+    /// the next attempt the way `.incoming.<pid>` was. A capture that gives up
+    /// after staging therefore has to say so, or the bytes stay forever.
+    #[test]
+    fn discarding_a_staged_artifact_removes_its_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("main.db");
+        std::fs::write(&src, b"pages").unwrap();
+        let report_dir = tmp.path().join("report");
+        std::fs::create_dir_all(&report_dir).unwrap();
+
+        let staged = stage_artifact(&report_dir, &src, "snap.db", u64::MAX).unwrap();
+        let Staged::Ready { tmp: ref path, .. } = staged else {
+            panic!("expected a staged copy, got {staged:?}");
+        };
+        let path = path.clone();
+        assert!(path.exists(), "the staged bytes are on disk");
+
+        staged.discard();
+        assert!(!path.exists(), "an abandoned staging path must not survive");
+    }
+
+    /// A failed copy must not leave its partial bytes behind under a name
+    /// nothing will ever look at again.
+    #[test]
+    fn a_staging_failure_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report_dir = tmp.path().join("report");
+        std::fs::create_dir_all(&report_dir).unwrap();
+
+        // A source that digests fine and then cannot be copied: remove it in
+        // between by staging from a path inside a directory we then delete.
+        let missing = tmp.path().join("gone.db");
+        let err = stage_artifact(&report_dir, &missing, "snap.db", u64::MAX)
+            .expect_err("a missing source must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        let leftovers: Vec<String> = std::fs::read_dir(&report_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(leftovers.is_empty(), "nothing staged: {leftovers:?}");
+    }
+
+    /// A process killed mid-preserve leaves a staging path nobody owns. It is
+    /// collected by the next capture — but only once it is old enough that it
+    /// cannot be a copy still in progress.
+    #[test]
+    fn abandoned_staging_paths_are_collected_but_live_ones_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report_dir = tmp.path().join("report");
+        std::fs::create_dir_all(&report_dir).unwrap();
+
+        let abandoned = report_dir.join("snap.db.faultbox-incoming.999.0.0");
+        std::fs::write(&abandoned, b"wreckage").unwrap();
+        let long_ago = std::time::SystemTime::now()
+            - std::time::Duration::from_millis(STAGING_STALE_MS as u64 * 2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&abandoned)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        // Another process's copy, started moments ago and still running.
+        let live = report_dir.join("other.db.faultbox-incoming.1000.0.0");
+        std::fs::write(&live, b"in flight").unwrap();
+
+        // A preserved artifact whose *name* merely looks temporary. It is older
+        // than the window, and it must survive: sweeping it would delete the
+        // very snapshot the report exists to carry.
+        let lookalike = report_dir.join("db.tmp.1");
+        std::fs::write(&lookalike, b"a real artifact").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lookalike)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        sweep_stale_staging(&report_dir);
+
+        assert!(!abandoned.exists(), "wreckage is collected");
+        assert!(
+            live.exists(),
+            "a copy still in progress must never be mistaken for wreckage"
+        );
+        assert!(
+            lookalike.exists(),
+            "a preserved artifact must never be swept, however its name reads"
+        );
+        assert!(
+            super::secure_fs::validate_artifact_name("db.tmp.1").is_ok(),
+            "and that name is one an adopter may legitimately choose"
         );
     }
 

@@ -122,7 +122,18 @@ pub fn record(
         //
         // The category is a developer-authored target name, not user data, and
         // is left alone — matching how local crumbs are treated.
-        ring.record(level, &category, &cfg.redactor.redact(&message));
+        //
+        // The redactor is adopter code, and this is a logging-shaped call on a
+        // hot path: a panic in it must not take down the operation that was
+        // merely recording a crumb. If it does panic the crumb is dropped rather
+        // than written unredacted — the ring is a durable, cross-process
+        // artifact, so an unredacted crumb here is a leak that outlives us.
+        let redacted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cfg.redactor.redact(&message)
+        }));
+        if let Ok(redacted) = redacted {
+            ring.record(level, &category, &redacted);
+        }
     }
 
     rec.record(Breadcrumb {

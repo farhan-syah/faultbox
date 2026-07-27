@@ -40,7 +40,22 @@ use crate::report::{Artifact, Env, EventKind, Meta, Report, SCHEMA_VERSION};
 use crate::writer;
 
 /// Presence of this env var marks a process as the crash monitor and carries
-/// the IPC socket name. Set by [`install`] on the spawned child.
+/// the IPC socket *path*. Set by [`install`] on the spawned child.
+///
+/// A path, not a Linux abstract socket name, and deliberately so. The abstract
+/// namespace carries no filesystem permissions at all: every local account in
+/// the network namespace can connect to any abstract name it can guess, and the
+/// name this crate used to pick — project, pid, and a millisecond timestamp —
+/// was guessable. `minidumper` does check the connecting peer's credentials
+/// against the crash context it sends, so nobody could ever have dumped a
+/// *different* process's memory through it; but an unrelated local user could
+/// still hand the monitor their own crash and have it written over the victim's
+/// `<fingerprint>/minidump`, destroying the evidence of a real crash and
+/// rewriting the report beside it, or simply hold the connection open so the
+/// monitor never exits.
+///
+/// A socket inside a `0700` directory is refused by the kernel instead, which is
+/// the access control the abstract namespace cannot express.
 pub const ENV_SOCKET: &str = "FAULTBOX_CRASH_SOCKET";
 const ENV_REPORTS_DIR: &str = "FAULTBOX_CRASH_REPORTS_DIR";
 const ENV_PROJECT: &str = "FAULTBOX_CRASH_PROJECT";
@@ -81,13 +96,20 @@ pub fn run_crash_monitor_if_env() -> bool {
     let Ok(socket) = std::env::var(ENV_SOCKET) else {
         return false;
     };
-    // Clear the marker before doing anything else so that any process the
-    // monitor itself spawns does not inherit monitor mode and mistake itself
-    // for a failed-to-divert child.
+    // The marker is deliberately *not* cleared here.
     //
-    // SAFETY: this runs at the very top of `main`, before the program has
-    // started any threads, so there is no concurrent reader of the environment.
-    unsafe { std::env::remove_var(ENV_SOCKET) };
+    // It used to be, so that anything the monitor spawned could not inherit
+    // monitor mode — but `std::env::remove_var` is unsafe in edition 2024
+    // because a concurrent `getenv` in another thread is undefined behaviour,
+    // and this is a safe public function. "Call it first in `main`" is a
+    // documented contract, not something the signature can enforce, so a caller
+    // who invokes it later got UB out of a safe call.
+    //
+    // Nothing is lost by dropping it: this path never returns to host code (it
+    // runs the server loop and exits), and the monitor spawns no children of its
+    // own. The misuse the clearing was insuring against — a process that
+    // inherited the marker and resumed normal startup — is caught by the guard
+    // in `install`, which sees the marker and refuses rather than multiplying.
     let code = run_monitor(&socket);
     std::process::exit(code);
 }
@@ -132,17 +154,57 @@ pub fn install(cfg: &crate::Config) {
     }
 }
 
+/// Create the private directory the IPC socket lives in, and return the socket
+/// path inside it.
+///
+/// The directory is the security boundary: `0700` means the kernel refuses a
+/// connection attempt from any other local account, which is what the Linux
+/// abstract namespace this used to use could not do. It is created exclusively,
+/// so a squatted name fails rather than being adopted.
+///
+/// The name is unpredictable on top of that — 128 bits from the OS CSPRNG where
+/// one is readable without taking a dependency. That is defence in depth, not
+/// the control: guessing the name buys nothing against a directory you cannot
+/// enter. Where no CSPRNG is reachable the fallback is merely unique, and the
+/// directory still does the real work.
+fn create_socket_dir() -> Result<(PathBuf, PathBuf), String> {
+    // Kept short: `sun_path` is 108 bytes including the NUL, and the system
+    // temporary directory is already ~50 of them on macOS.
+    let dir = std::env::temp_dir().join(format!("fbx-{}", socket_token()));
+    crate::secure_fs::create_dir_exclusive(&dir)
+        .map_err(|e| format!("create socket directory {}: {e}", dir.display()))?;
+    let socket = dir.join("s");
+    Ok((dir, socket))
+}
+
+fn socket_token() -> String {
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut bytes = [0u8; 16];
+            if f.read_exact(&mut bytes).is_ok() {
+                let mut out = String::with_capacity(32);
+                for b in bytes {
+                    out.push_str(&format!("{b:02x}"));
+                }
+                return out;
+            }
+        }
+    }
+    format!("{}-{}", std::process::id(), crate::now_ms())
+}
+
 fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let (socket_dir, socket) = create_socket_dir()?;
 
-    // Unique per (pid, start) so concurrent processes don't collide. No RNG
-    // dependency: pid + capture time is sufficiently unique for a socket name.
-    let socket = format!(
-        "faultbox-{}-{}-{}",
-        cfg.project,
-        std::process::id(),
-        crate::now_ms()
-    );
+    // Any failure from here leaves the private directory behind, so every exit
+    // path removes it.
+    let cleanup = |e: String| {
+        let _ = std::fs::remove_dir_all(&socket_dir);
+        e
+    };
 
     // Spawn the monitor: a re-exec of ourselves that `run_crash_monitor_if_env`
     // will divert into the server loop. It inherits no args (empty argv) — the
@@ -172,7 +234,9 @@ fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
         // to the app's group, and outlives a shell that backgrounded the app.
         cmd.process_group(0);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("spawn monitor: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| cleanup(format!("spawn monitor: {e}")))?;
 
     // Connect to the monitor, retrying while it binds the socket.
     //
@@ -189,10 +253,10 @@ fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!(
+            return Err(cleanup(format!(
                 "{e} — the monitor process was killed. Ensure `main` calls \
                  `faultbox::run_crash_monitor_if_env()` before any other work."
-            ));
+            )));
         }
     };
 
@@ -229,23 +293,17 @@ fn try_install(cfg: &crate::Config) -> Result<Guard, String> {
             crash_handler::CrashEventResult::Handled(handled)
         })
     })
-    .map_err(|e| format!("attach crash handler: {e}"))?;
+    .map_err(|e| cleanup(format!("attach crash handler: {e}")))?;
 
     Ok(Guard { _handler: handler })
 }
 
 /// Connect a client to the monitor's socket, retrying briefly while the child
 /// process binds it.
-fn connect_with_retry(socket: &str) -> Result<minidumper::Client, String> {
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let sock_path = std::env::temp_dir().join(socket);
+fn connect_with_retry(socket: &std::path::Path) -> Result<minidumper::Client, String> {
     let mut last = String::new();
     for _ in 0..200 {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let name = minidumper::SocketName::Abstract(socket);
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let name = minidumper::SocketName::Path(&sock_path);
-        match minidumper::Client::with_name(name) {
+        match minidumper::Client::with_name(minidumper::SocketName::Path(socket)) {
             Ok(c) => return Ok(c),
             Err(e) => {
                 last = e.to_string();
@@ -259,28 +317,30 @@ fn connect_with_retry(socket: &str) -> Result<minidumper::Client, String> {
 /// Monitor entry point: run the minidump server until the app disconnects.
 /// Returns the process exit code.
 fn run_monitor(socket: &str) -> i32 {
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let sock_path = std::env::temp_dir().join(socket);
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let name = minidumper::SocketName::Abstract(socket);
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let name = minidumper::SocketName::Path(&sock_path);
-    let mut server = match minidumper::Server::with_name(name) {
+    let socket = std::path::Path::new(socket);
+    let mut server = match minidumper::Server::with_name(minidumper::SocketName::Path(socket)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("faultbox monitor: bind {socket}: {e}");
+            eprintln!("faultbox monitor: bind {}: {e}", socket.display());
             return 1;
         }
     };
     let shutdown = std::sync::atomic::AtomicBool::new(false);
     let handler = MonitorHandler::from_env();
-    match server.run(Box::new(handler), &shutdown, None) {
+    let code = match server.run(Box::new(handler), &shutdown, None) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("faultbox monitor: server run: {e}");
             1
         }
+    };
+    // The monitor outlives the application it was watching, so it is the one
+    // that can clean up: drop the socket and the private directory holding it
+    // rather than leaving them in the system temporary directory.
+    if let Some(dir) = socket.parent() {
+        let _ = std::fs::remove_dir_all(dir);
     }
+    code
 }
 
 /// Server-side handler: writes each minidump to a fresh report directory and
@@ -419,10 +479,15 @@ impl minidumper::ServerHandler for MonitorHandler {
         // The group is keyed by fingerprint, so a crash loop overwrites one
         // minidump and bumps a counter rather than filling the disk.
         let (_, fingerprint) = self.crash_fingerprint();
-        let dir = writer::group_dir(&self.reports_dir, &fingerprint);
-        std::fs::create_dir_all(&dir)?;
+        let dir = writer::ensure_group_dir(&self.reports_dir, &fingerprint)?;
         let path = dir.join("minidump");
-        let file = std::fs::File::create(&path)?;
+        // A minidump is the crashed process's entire address space — every key,
+        // token and buffer it held at the moment of the fault. It is the single
+        // most sensitive thing this crate ever writes, so it is owner-only, and
+        // the previous dump is removed rather than truncated in place so the
+        // replacement cannot inherit a widened mode.
+        let _ = std::fs::remove_file(&path);
+        let file = crate::secure_fs::create_new_private(&path)?;
         Ok((file, path))
     }
 

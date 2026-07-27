@@ -15,6 +15,31 @@ Releases are cut from this file: the release workflow refuses a tag whose base v
 
 ---
 
+## [Unreleased]
+
+A hardening release from an internal audit. Nothing is removed from the public API and no existing signature changes, so upgrading is a drop-in. `cargo deny check` reports no advisories anywhere in the dependency tree.
+
+Two changes alter observable behaviour and are worth reading before you upgrade.
+
+### Changed
+
+- **Report directories and files are created owner-only on unix** — `0700` directories, `0600` files — rather than at the process umask, and a preserved artifact no longer inherits a permissive mode from its source. A group directory created by an earlier version is narrowed the next time it is written to. **If something other than the reporting user reads your reports directory — a support account, a log shipper — it will lose access.** Windows has no mode bits and this crate sets no explicit DACL, so there the directory stays exactly as private as the location you point it at.
+- **Preserved-artifact names must be a single plain path component.** A name carrying a path separator, `..`, or one of the recorder's own file names is refused and recorded on the report as `NOT PRESERVED` instead of being acted on. Ordinary names (`store.corrupt`, `main.db`) are unaffected.
+- **Artifact digests are SHA-256** instead of 64-bit FNV-1a, so a digest recorded by an earlier version will not match a new one and the first capture after upgrading re-copies its artifact. Grouping fingerprints are unchanged, so existing report directories keep their identity.
+- `run_crash_monitor_if_env` no longer clears its own environment marker; the guard in `init` is unaffected. (`native-crash`)
+
+### Security
+
+- Hardening across the writer, the redaction path, the shared-memory breadcrumb ring, and the `native-crash` monitor's IPC. Every string on a report — including backtrace frames, the thread name, and artifact notes — now passes through the configured `Redactor`, and a panic inside an adopter's `Redactor` or `DomainContext` can no longer reach the caller: the capture is abandoned rather than written half-redacted.
+
+### Added
+
+- `faultbox::digest`, a dependency-free SHA-256 — a crash reporter's dependency tree is code that runs inside a failing process.
+- `faultbox::secure_fs::validate_artifact_name`, so a caller can check a name before handing it to `Capture::preserve`.
+- `redact::MAX_JSON_DEPTH`, `redact::REDACTED_DEPTH`, `shared_ring::MAX_CAPACITY`, and `writer::Staged::discard`.
+
+---
+
 ## [0.1.1] - 2026-07-27
 
 A redaction release. `BasicRedactor` recognised one lexical shape for a credential and let every other one through; this fixes that class rather than the two reported instances of it.
