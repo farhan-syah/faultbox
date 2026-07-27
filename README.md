@@ -244,7 +244,7 @@ Every string entering a report — messages, error chains, breadcrumbs, domain v
 `BasicRedactor` masks:
 
 - **Paths** — home directory to `~`, username elsewhere to `~user`. Case- and separator-insensitive, path-boundary aware.
-- **Credential assignments** — the value under a key naming a credential (`password`, `token`, `authorization`, `cookie`, `x-api-key`, `AZURE_OPENAI_KEY`), quoted or bare, spaced or tight, inside `Some(…)`, or after an auth scheme (`Bearer <token>`).
+- **Credential assignments** — the value under a key naming a credential (`password`, `token`, `authorization`, `cookie`, `x-api-key`, `AZURE_OPENAI_KEY`), quoted or bare, spaced or tight, or after an auth scheme (`Bearer <token>`). A composite value — `Some("…")`, `["…", "…"]`, `Secret { inner: "…" }` — is masked leaf by leaf, structure kept.
 - **JSON** — the same keys as object members, in breadcrumb fields and `DomainContext` payloads. A masked leaf becomes the `[redacted]` string whatever its type was.
 - **Keyless credentials** — issuer prefixes (`sk-`, `ghp_`, `AKIA`, …), JWTs, PEM blocks.
 - **Addresses** — emails however punctuated, including object keys made of one.

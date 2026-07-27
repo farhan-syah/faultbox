@@ -106,17 +106,64 @@ fn whitespace_around_the_separator_does_not_defeat_matching() {
     assert_no_trace(&out, "sk-spaced-1234");
 }
 
+/// A composite value is masked in full, not just its first element.
+///
+/// `Option<String>` is the ordinary shape for an optional API key, and a stray
+/// `{:?}` of the config struct holding it is exactly the accident a redactor
+/// exists to absorb — but the wrapper is only the smallest version of the
+/// problem. Whenever the value is built out of more than one piece, masking the
+/// first and stopping prints the `[redacted]` marker *beside* the surviving
+/// secret, which reads as handled and is worse than an obvious miss.
 #[test]
-fn wrapped_values_are_masked_inside_the_wrapper() {
+fn composite_values_are_masked_through_their_structure() {
     let r = redactor();
 
-    // `Debug` of an `Option<String>` field — the wrapper's `(` and `"` sit
-    // between the separator and the credential.
+    let out =
+        r.redact(r#"LlmConfig { api_key: Some("sk-azure-9f8e7d6c"), endpoint: "https://x" }"#);
+    assert_no_trace(&out, "sk-azure-9f8e7d6c");
+    assert_eq!(
+        out, r#"LlmConfig { api_key: Some("[redacted]"), endpoint: "https://x" }"#,
+        "the wrapper is structure worth keeping, and a sibling field is not the secret"
+    );
+
+    // An unquoted sibling outside the group is not swept up with it.
     let out = r.redact(r#"Config { token: Some("sk-opt-1234"), retries: 3 }"#);
     assert_no_trace(&out, "sk-opt-1234");
+    assert_eq!(out, r#"Config { token: Some("[redacted]"), retries: 3 }"#);
+
+    // Every element, not the first one.
+    let out = r.redact(r#"token: Credentials("ada", "hunter2")"#);
+    assert_no_trace(&out, "hunter2");
+    assert_eq!(out, r#"token: Credentials("[redacted]", "[redacted]")"#);
+
+    let out = r.redact(r#"token: ["aaa", "bbb"]"#);
+    assert_no_trace(&out, "bbb");
+
+    // A braced `Debug` struct spaces its bracket out, and nests field names.
+    let out = r.redact(r#"password: Secret { inner: "hunter2", tries: 3 }"#);
+    assert_no_trace(&out, "hunter2");
     assert_eq!(
-        out, r#"Config { token: Some("[redacted]"), retries: 3 }"#,
-        "the wrapper is structure worth keeping; only its payload is a secret"
+        out, r#"password: Secret { inner: "[redacted]", tries: [redacted] }"#,
+        "under a key that means credential outright, everything inside is suspect"
+    );
+
+    let out = r.redact(r#"api_key: Some(Secret("hunter2"))"#);
+    assert_no_trace(&out, "hunter2");
+}
+
+#[test]
+fn a_composite_under_a_credential_adjacent_key_is_judged_field_by_field() {
+    let r = redactor();
+
+    // A weak key must not mask a whole structure on the strength of its own
+    // name — `grouping_key` is what a report is fingerprinted by. Its members
+    // are judged on their own names instead, so the nested credential is still
+    // caught.
+    let out = r.redact(r#"grouping_key: Key { kind: "0x09", password: "hunter2" }"#);
+    assert_no_trace(&out, "hunter2");
+    assert_eq!(
+        out,
+        r#"grouping_key: Key { kind: "0x09", password: "[redacted]" }"#
     );
 }
 

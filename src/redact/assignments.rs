@@ -11,11 +11,11 @@
 //! case rather than four.
 //!
 //! The value's extent follows its form: a quoted value runs to its closing
-//! quote (a password may contain a space), a `Debug` wrapper such as `Some(…)`
-//! is descended into (the wrapper is structure, its payload is not), a value
-//! introduced by an HTTP auth scheme takes the scheme *and* the credential
-//! after it (`Bearer` alone is not the secret), and anything else is a single
-//! token.
+//! quote (a password may contain a space), a composite value — `Some("…")`,
+//! `Credentials("…", "…")`, `["…", "…"]`, `Secret { inner: "…" }` — has *every*
+//! leaf inside it masked while its structure is kept, a value introduced by an
+//! HTTP auth scheme takes the scheme *and* the credential after it (`Bearer`
+//! alone is not the secret), and anything else is a single token.
 //!
 //! That last rule is where a multi-word secret could still hide — `token: abc
 //! def` masks only `abc`. It is nonetheless the right rule, because the
@@ -59,11 +59,7 @@ pub(super) fn mask(input: &str) -> Cow<'_, str> {
         if (bytes[i] == b'=' || bytes[i] == b':')
             && let Some(kind) = key_kind_ending_at(input, i)
         {
-            let (resume, masked) = value_span(input, i + 1, kind);
-            if let Some((start, end)) = masked {
-                edit.replace(start, end, REDACTED);
-            }
-            i = resume;
+            i = mask_value(input, i + 1, kind, &mut edit);
             continue;
         }
         // Step over one whole UTF-8 character.
@@ -111,57 +107,163 @@ fn is_key_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
 }
 
-/// Locate the value starting at `i`: the span to mask, if any, and the index
-/// the main scan resumes from. Everything not named as a masked span is
-/// untouched input, and stays that way.
-fn value_span(input: &str, mut i: usize, kind: KeyKind) -> (usize, Option<(usize, usize)>) {
+/// Mask the value starting at `i`, and return the index the main scan resumes
+/// from. Everything not recorded as a masked span is untouched input, and stays
+/// that way.
+fn mask_value(input: &str, mut i: usize, kind: KeyKind, edit: &mut Edit) -> usize {
     let b = input.as_bytes();
 
-    // Iterative rather than recursive: redaction runs inside the panic hook,
-    // where a stack overflow on adversarially nested input would be a second,
-    // worse failure than the one being reported.
-    loop {
-        // Whitespace between the separator and the value is layout, not value.
-        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-            i += 1;
-        }
-        if i >= b.len() {
-            return (i, None);
-        }
-        // Already redacted — by this redactor on an earlier pass, or by the
-        // adopter's own before the string reached us. Step over the marker
-        // rather than treating it as a fresh value and emitting `[redacted]]`.
-        if input[i..].starts_with(REDACTED) {
-            return (i + REDACTED.len(), None);
-        }
-        if b[i] == b'"' || b[i] == b'\'' {
-            return quoted_span(input, i + 1, b[i], kind);
-        }
-        // `Some(` / `Secret(` — keep the wrapper, redact what it holds.
-        let Some(open) = wrapper_open(input, i) else {
-            break;
+    // Whitespace between the separator and the value is layout, not value.
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if i >= b.len() {
+        return i;
+    }
+    // Already redacted — by this redactor on an earlier pass, or by the
+    // adopter's own before the string reached us. Step over the marker rather
+    // than treating it as a fresh value and emitting `[redacted]]`.
+    if input[i..].starts_with(REDACTED) {
+        return i + REDACTED.len();
+    }
+    if b[i] == b'"' || b[i] == b'\'' {
+        let (content_end, after) = quoted_extent(input, i);
+        return if mask_leaf(input, i + 1, content_end, kind, edit) {
+            after
+        } else {
+            i + 1
         };
-        i = open + 1;
+    }
+    // A composite value — `Some("…")`, `Credentials("…", "…")`, `["…", "…"]`,
+    // `Secret { inner: "…" }` — hides its payload behind structure, and behind
+    // *more than one* piece of it. Masking the first leaf and stopping is how a
+    // `[redacted]` marker ends up printed next to the surviving secret.
+    //
+    // Only for a strong key: under a weak one the group is handed back to the
+    // main scan instead, so an inner `password:` is judged on its own name
+    // rather than on the outer key's.
+    if kind == KeyKind::Strong
+        && let Some(open) = group_open(input, i)
+    {
+        return mask_group(input, open, kind, edit);
     }
 
     let end = scheme_span(input, i).unwrap_or_else(|| token_end(input, i));
-    if masks(&input[i..end], kind) {
-        (end, Some((i, end)))
+    if mask_leaf(input, i, end, kind, edit) {
+        end
     } else {
         // Left as it stands — and *not* skipped over, because a value that
         // stays readable may itself contain the next assignment. Handing the
         // span back to the main scan is what makes redaction idempotent:
         // whether an inner `key=value` is seen must not depend on what
         // preceded it.
-        (i, None)
+        i
     }
 }
 
-/// A quoted value ends at its closing quote, whatever it contains. `i` is the
-/// first byte of the content; the opening quote is behind it.
-fn quoted_span(input: &str, i: usize, quote: u8, kind: KeyKind) -> (usize, Option<(usize, usize)>) {
+/// Mask every leaf inside the balanced group opening at `open`, keeping the
+/// structure — brackets, field names, wrapper names, punctuation — intact.
+/// Returns the index just past the matching close.
+///
+/// Iterative, with a depth counter rather than recursion: redaction runs inside
+/// the panic hook, where a stack overflow on adversarially nested input would
+/// be a second, worse failure than the one being reported.
+fn mask_group(input: &str, open: usize, kind: KeyKind, edit: &mut Edit) -> usize {
     let b = input.as_bytes();
+    let mut i = open + 1;
+    let mut depth = 1u32;
+
+    while i < b.len() {
+        // A marker from an earlier pass is structure now, not a value: reading
+        // its brackets as a nested group would nest it again on every pass.
+        if input[i..].starts_with(REDACTED) {
+            i += REDACTED.len();
+            continue;
+        }
+        match b[i] {
+            b'"' | b'\'' => {
+                let (content_end, after) = quoted_extent(input, i);
+                mask_leaf(input, i + 1, content_end, kind, edit);
+                i = after;
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            c if is_leaf_byte(c) => {
+                let start = i;
+                while i < b.len() && is_leaf_byte(b[i]) {
+                    i += 1;
+                }
+                // A field name or a wrapper name introduces a value; it is not
+                // one.
+                if !introduces_a_value(input, i) {
+                    mask_leaf(input, start, i, kind, edit);
+                }
+            }
+            _ => {
+                i += 1;
+                while i < b.len() && (b[i] & 0xC0) == 0x80 {
+                    i += 1;
+                }
+            }
+        }
+    }
+    i
+}
+
+/// Where a composite value opens, if it does: a bracket, or a type name
+/// followed by one — `Some(`, `Credentials(`, `Secret {`.
+fn group_open(input: &str, i: usize) -> Option<usize> {
+    let b = input.as_bytes();
+    if matches!(b[i], b'(' | b'[' | b'{') {
+        return Some(i);
+    }
+    if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
+        return None;
+    }
     let mut j = i;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    if j < b.len() && matches!(b[j], b'(' | b'[') {
+        return Some(j);
+    }
+    // `Name { … }` — the one form that spaces its bracket out.
+    let mut k = j;
+    while k < b.len() && (b[k] == b' ' || b[k] == b'\t') {
+        k += 1;
+    }
+    (k > j && k < b.len() && b[k] == b'{').then_some(k)
+}
+
+/// Does the token ending at `at` name something that follows, rather than being
+/// a value itself?
+fn introduces_a_value(input: &str, at: usize) -> bool {
+    let b = input.as_bytes();
+    let mut j = at;
+    while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+        j += 1;
+    }
+    j < b.len() && matches!(b[j], b':' | b'(' | b'{')
+}
+
+fn is_leaf_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+' | b'/' | b'=' | b'~' | b'@')
+}
+
+/// The content and the far side of a quoted run starting at `quote_at`.
+fn quoted_extent(input: &str, quote_at: usize) -> (usize, usize) {
+    let b = input.as_bytes();
+    let quote = b[quote_at];
+    let mut j = quote_at + 1;
     while j < b.len() && b[j] != quote {
         // A `Debug`-escaped quote is content, not the end of the value.
         j += if b[j] == b'\\' && j + 1 < b.len() {
@@ -171,25 +273,17 @@ fn quoted_span(input: &str, i: usize, quote: u8, kind: KeyKind) -> (usize, Optio
         };
     }
     let end = j.min(b.len());
-    if masks(&input[i..end], kind) {
-        (end, Some((i, end)))
-    } else {
-        (i, None)
-    }
+    (end, if end < b.len() { end + 1 } else { end })
 }
 
-/// `Some(`, `Secret(`, `Sensitive(` — an identifier immediately followed by an
-/// open parenthesis. Returns the index of that parenthesis.
-fn wrapper_open(input: &str, i: usize) -> Option<usize> {
-    let b = input.as_bytes();
-    if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
-        return None;
+/// Record `input[start..end]` as masked, if it is a value this key masks.
+fn mask_leaf(input: &str, start: usize, end: usize, kind: KeyKind, edit: &mut Edit) -> bool {
+    let value = &input[start..end];
+    if value == REDACTED || !masks(value, kind) {
+        return false;
     }
-    let mut j = i;
-    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-        j += 1;
-    }
-    (j < b.len() && b[j] == b'(').then_some(j)
+    edit.replace(start, end, REDACTED);
+    true
 }
 
 /// If the value opens with an HTTP auth scheme, the value is the scheme plus

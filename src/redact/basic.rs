@@ -27,9 +27,11 @@ use std::borrow::Cow;
 ///   and separator spelling, and respects path boundaries.
 /// - Masks the value of a `key = value` pair whose key names a credential
 ///   (`password`, `token`, `authorization`, `x-api-key`, `AZURE_OPENAI_KEY`, …)
-///   in whatever form it arrives: quoted or bare, spaced or tight, wrapped in
-///   `Some(…)`, or introduced by an HTTP auth scheme, where the credential
-///   follows the scheme word.
+///   in whatever form it arrives: quoted or bare, spaced or tight, or
+///   introduced by an HTTP auth scheme, where the credential follows the scheme
+///   word. A composite value — `Some("…")`, `Credentials("…", "…")`,
+///   `["…", "…"]`, `Secret { inner: "…" }` — has every leaf inside it masked,
+///   its structure kept.
 /// - Masks the same keys inside JSON — including breadcrumb fields and
 ///   [`DomainContext`](crate::DomainContext) payloads, where the key is an
 ///   object member and a per-string scan would never see it.
