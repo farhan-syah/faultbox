@@ -138,11 +138,7 @@ jobs:
         run: |
           PREVIOUS_TAG=$(git tag --sort=-v:refname 'v*' | grep -v "^${TAG}$" | head -n 1 || true)
 
-          awk -v version="$BASE" '
-            $0 ~ "^## \\[" version "\\]" { found = 1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > /tmp/changelog-section.md
+          bash scripts/ci/changelog_section.sh "$BASE" /tmp/changelog-section.md
 
           {
             cat /tmp/changelog-section.md

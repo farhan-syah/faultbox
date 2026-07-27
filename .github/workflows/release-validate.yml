@@ -87,24 +87,4 @@ jobs:
       # the `## [0.1.1]` section it is a candidate for, so the notes are written
       # once and rehearsed by every beta.
       - name: Require a changelog section
-        env:
-          BASE: ${{ steps.version.outputs.base_version }}
-        run: |
-          if [[ ! -f CHANGELOG.md ]]; then
-            echo "::error::CHANGELOG.md is required to cut a release"
-            exit 1
-          fi
-
-          awk -v version="$BASE" '
-            $0 ~ "^## \\[" version "\\]" { found = 1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > /tmp/changelog-section.md
-
-          if [[ ! -s /tmp/changelog-section.md ]]; then
-            echo "::error::CHANGELOG.md has no non-empty '## [$BASE]' section. Rename the Unreleased heading to [$BASE] and describe the release."
-            exit 1
-          fi
-
-          echo "Changelog section for [$BASE]:"
-          cat /tmp/changelog-section.md
+        run: bash scripts/ci/changelog_section.sh "${{ steps.version.outputs.base_version }}"
