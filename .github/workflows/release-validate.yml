@@ -18,6 +18,9 @@ on:
       is_full_release:
         description: "true when the version carries no prerelease suffix"
         value: ${{ jobs.validate.outputs.is_full_release }}
+      base_version:
+        description: "Tag version with any prerelease suffix stripped — the CHANGELOG heading"
+        value: ${{ jobs.validate.outputs.base_version }}
 
 permissions:
   contents: read
@@ -29,6 +32,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       is_full_release: ${{ steps.version.outputs.is_full_release }}
+      base_version: ${{ steps.version.outputs.base_version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -72,3 +76,35 @@ jobs:
           fi
 
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "base_version=$TAG_BASE" >> "$GITHUB_OUTPUT"
+
+      # A release with no changelog entry is a release nobody can read. The gate
+      # lives here, in the shared validator, so the tag push and the dispatched
+      # publish cannot disagree about whether it was satisfied — and so it fails
+      # at the tag, before the suite runs, rather than after publishing.
+      #
+      # A prerelease is checked against its base version: `v0.1.1-beta.1` needs
+      # the `## [0.1.1]` section it is a candidate for, so the notes are written
+      # once and rehearsed by every beta.
+      - name: Require a changelog section
+        env:
+          BASE: ${{ steps.version.outputs.base_version }}
+        run: |
+          if [[ ! -f CHANGELOG.md ]]; then
+            echo "::error::CHANGELOG.md is required to cut a release"
+            exit 1
+          fi
+
+          awk -v version="$BASE" '
+            $0 ~ "^## \\[" version "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/changelog-section.md
+
+          if [[ ! -s /tmp/changelog-section.md ]]; then
+            echo "::error::CHANGELOG.md has no non-empty '## [$BASE]' section. Rename the Unreleased heading to [$BASE] and describe the release."
+            exit 1
+          fi
+
+          echo "Changelog section for [$BASE]:"
+          cat /tmp/changelog-section.md
