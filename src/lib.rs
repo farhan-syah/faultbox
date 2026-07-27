@@ -33,6 +33,7 @@ pub mod context;
 pub mod native;
 pub mod panic;
 pub mod reader;
+pub mod redact;
 pub mod report;
 #[cfg(feature = "shared-ring")]
 pub mod shared_ring;
@@ -46,7 +47,8 @@ use std::sync::OnceLock;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use context::{Adhoc, BasicRedactor, DomainContext, NoopRedactor, Redactor};
+pub use context::{Adhoc, DomainContext};
+pub use redact::{BasicRedactor, NoopRedactor, Redactor};
 pub use report::{Artifact, Env, EventKind, Frame, Meta, Report, SCHEMA_VERSION};
 #[cfg(feature = "tracing")]
 pub use tracing_layer::BreadcrumbLayer;

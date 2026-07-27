@@ -40,7 +40,7 @@ Poor fit:
 - `no_std` and embedded targets. This crate is std-only.
 - Software whose only realistic failure is a panic, already reported somewhere. A panic-only reporter is simpler and does that job.
 
-**Libraries are a good fit, and are expected to be one.** A library should not call `init`, install hooks, or choose the reports directory — that belongs to the binary. But a library that detects its own corruption *should* report it, and everything here stays inert until an application initializes, so depending on it costs a library nothing. See [Using it across a dependency stack](#using-it-across-a-dependency-stack).
+**Libraries are a good fit, and are expected to be one.** A library should not call `init`, install hooks, or choose the reports directory — that belongs to the binary. But a library that detects its own corruption _should_ report it, and everything here stays inert until an application initializes, so depending on it costs a library nothing. See [Using it across a dependency stack](#using-it-across-a-dependency-stack).
 
 ## Usage
 
@@ -214,7 +214,7 @@ An existing ring is joined as-is and **its** capacity is adopted, even if this c
 
 Because the ring is a file, it also outlives the process that wrote it. With `native-crash` enabled as well, the crash monitor recovers the trail after a fatal signal and writes it into the report — so a native crash arrives with the operations that led up to it instead of a bare minidump. The in-process recorder cannot do this: it dies with the process, and a signal handler could not read it in any case, because it sits behind a `Mutex`.
 
-Crumbs are redacted on the way *into* the ring rather than on the way out of a report. The monitor is a separate process with no access to your `Redactor`, so anything written to the ring has to be safe already.
+Crumbs are redacted on the way _into_ the ring rather than on the way out of a report. The monitor is a separate process with no access to your `Redactor`, so anything written to the ring has to be safe already.
 
 ### `native-crash` requires one line in `main`
 
@@ -239,9 +239,19 @@ Config::new(/* … */).install_native_crash_handler(true)
 
 ## Redaction
 
-Every string entering a report — messages, error chains, breadcrumbs, domain values — passes through a `Redactor`. `BasicRedactor` strips the home directory, masks `key=value` pairs naming a secret, and masks email addresses. It is a sensible default, not a compliance boundary: projects handling regulated data should compose their own on top.
+Every string entering a report — messages, error chains, breadcrumbs, domain values — passes through a `Redactor`. The default is `NoopRedactor`, so set one explicitly before reports leave a machine.
 
-The default is `NoopRedactor`, so set one explicitly before reports leave a machine.
+`BasicRedactor` masks:
+
+- **Paths** — home directory to `~`, username elsewhere to `~user`. Case- and separator-insensitive, path-boundary aware.
+- **Credential assignments** — the value under a key naming a credential (`password`, `token`, `authorization`, `cookie`, `x-api-key`, `AZURE_OPENAI_KEY`), quoted or bare, spaced or tight, inside `Some(…)`, or after an auth scheme (`Bearer <token>`).
+- **JSON** — the same keys as object members, in breadcrumb fields and `DomainContext` payloads. A masked leaf becomes the `[redacted]` string whatever its type was.
+- **Keyless credentials** — issuer prefixes (`sk-`, `ghp_`, `AKIA`, …), JWTs, PEM blocks.
+- **Addresses** — emails however punctuated, including object keys made of one.
+
+Limits: no entropy scoring, so build-ids and hashes survive. An unquoted value is one token — `token: abc def` masks only `abc`; quote it or use an auth scheme for the full span. Credential-_adjacent_ keys (`grouping_key`, `auth`) mask only credential-shaped values, so `grouping_key=kind=0x09` stays readable.
+
+It is a sensible default, not a compliance boundary: projects handling regulated data should compose their own on top.
 
 ## Platform support
 
