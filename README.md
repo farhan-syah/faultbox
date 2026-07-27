@@ -265,6 +265,14 @@ Requires `std`; there is no `no_std` build. Linux, macOS, and Windows run the fu
 
 Pre-1.0, the on-disk report shape is changed in place as the crate learns what triage actually needs. There are no migrations and no compatibility shims — reports are short-lived diagnostic artifacts, so delete a stale reports directory rather than parsing an older layout.
 
+Notable changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+## Contributing
+
+Bug reports and PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). A reproducing program is worth more than a description.
+
+Security issues go through [GitHub Security Advisories](https://github.com/farhan-syah/faultbox/security/advisories/new), not public issues; [SECURITY.md](SECURITY.md) covers what qualifies. A missed credential shape in `BasicRedactor` is an ordinary bug — file it publicly.
+
 ## License
 
 MIT OR Apache-2.0.
