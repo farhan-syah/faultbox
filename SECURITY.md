@@ -8,9 +8,9 @@ A crash reporter has an unusual security shape: it is code that runs while a pro
 
 While `faultbox` is pre-1.0, fixes are issued **only against the latest released version**.
 
-| Version  | Supported          |
-| -------- | ------------------ |
-| 0.1.x    | :white_check_mark: |
+| Version | Supported          |
+| ------- | ------------------ |
+| 0.1.x   | :white_check_mark: |
 
 Always run the latest release; it carries every prior fix.
 

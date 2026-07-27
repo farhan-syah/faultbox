@@ -5,20 +5,19 @@ All notable changes to `faultbox` will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 `faultbox` uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Releases are cut from this file: the release workflow refuses a tag whose base
-version has no non-empty section here, and publishes that section as the GitHub
-release notes. Rename `[Unreleased]` to the version you are tagging before you
-push the tag.
+Releases are cut from this file: the release workflow refuses a tag whose base version has no non-empty section here, and publishes that section as the GitHub release notes. Rename `[Unreleased]` to the version you are tagging before you push the tag.
 
-<!-- Link definitions live above the first section: everything below a version
-     heading is extracted verbatim into that release's notes. -->
+<!-- Link definitions live above the first section: everything below a version heading is extracted verbatim into that release's notes. -->
 
-[unreleased]: https://github.com/farhan-syah/faultbox/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/farhan-syah/faultbox/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/farhan-syah/faultbox/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/farhan-syah/faultbox/releases/tag/v0.1.0
 
 ---
 
-## [Unreleased]
+## [0.1.1] - 2026-07-27
+
+A redaction release. `BasicRedactor` recognised one lexical shape for a credential and let every other one through; this fixes that class rather than the two reported instances of it.
 
 ### Fixed
 
@@ -32,7 +31,7 @@ push the tag.
 ### Added
 
 - **Keyless credential detection.** A credential with no key in front of it — pasted into a retry log, embedded in a URL, echoed inside a stack trace — is masked on its own evidence: issuer prefixes (`sk-`, `ghp_`, `AKIA`, …), JWT structure, or a PEM block. Deliberately not entropy-based, so build-ids, hashes and trace-ids survive.
-- **Credential key names are matched by suffix**, so `AZURE_OPENAI_KEY`, `x-api-key` and `apiKey` all resolve. Names that are merely credential-*adjacent* (`key`, `auth`, `session`, `signature`) form a second tier and mask only a value that is itself credential-shaped, so `grouping_key=kind=0x09` — the field a report is fingerprinted by — stays readable.
+- **Credential key names are matched by suffix**, so `AZURE_OPENAI_KEY`, `x-api-key` and `apiKey` all resolve. Names that are merely credential-_adjacent_ (`key`, `auth`, `session`, `signature`) form a second tier and mask only a value that is itself credential-shaped, so `grouping_key=kind=0x09` — the field a report is fingerprinted by — stays readable.
 - The username is now stripped from paths outside `$HOME` too: `/var/log/ada/store.log` becomes `/var/log/~user/store.log`. Generic and very short usernames are left alone.
 - `Redactor::redact_value_for_key` and `Redactor::redact_key`, both default-implemented, so a redactor can act on the key/value relationship a per-string scan never sees. Existing implementations are unaffected.
 - `faultbox::redact` module, with `REDACTED` and `REDACTED_EMAIL` exported for redactors composing on top of the markers.
